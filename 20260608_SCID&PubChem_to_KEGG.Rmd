@@ -1,0 +1,1081 @@
+#7. ChEBI / PubChem / HMDB 轉 KEGG
+#8. KEGG ID 加回 annotation table
+#9. 用 Compound 對回 measurement
+#10. 做 fold change、heatmap、condition-specific metabolite、KEGG pathway input
+
+#coding Step
+#29 ChEBI → KEGG
+#30 PubChem → KEGG
+#31 HMDB → KEGG：匯出 HMDB list 給 MetaboAnalyst
+#32 讀回 MetaboAnalyst 的 HMDB-to-KEGG 結果
+#33 合併 ChEBI / PubChem / HMDB 三條 KEGG mapping
+
+
+```{r}
+#----29. define KEGG REST conversion function----
+# 這一步在做什麼？
+# 1. 建立一個通用 function，用來把 ChEBI 或 PubChem ID 轉成 KEGG Compound ID。
+# 2. 這個 function 會呼叫 KEGG REST API。
+# 3. 每次 request 之間停 0.4 秒，避免打太快被擋。
+#
+# 這一步得到的 Data 代表什麼？
+# convert_kegg_id：
+#   一個後面會重複使用的 function。
+#   它本身還不是資料表。
+
+convert_kegg_id <- function(query_vec, query_col_name, sleep_sec = 0.4) {
+  
+  query_vec <- unique(na.omit(as.character(query_vec)))
+  
+  result_list <- vector("list", length(query_vec))
+  
+  for (i in seq_along(query_vec)) {
+    
+    query_i <- query_vec[i]
+    
+    message("KEGG conversion: ", i, " / ", length(query_vec), " ; ", query_i)
+    
+    result_list[[i]] <- tryCatch({
+      
+      url <- paste0(
+        "https://rest.kegg.jp/conv/compound/",
+        query_i
+      )
+      
+      res <- readLines(url, warn = FALSE)
+      
+      if (length(res) == 0) {
+        
+        tibble(
+          Query_ID = query_i,
+          KEGG_ID = NA_character_
+        )
+        
+      } else {
+        
+        tibble(raw = res) %>%
+          separate(raw, into = c("Source_ID", "KEGG_raw"), sep = "\t") %>%
+          mutate(
+            Query_ID = query_i,
+            KEGG_ID = str_replace(KEGG_raw, "^cpd:", "")
+          ) %>%
+          select(Query_ID, KEGG_ID)
+      }
+      
+    }, error = function(e) {
+      
+      tibble(
+        Query_ID = query_i,
+        KEGG_ID = NA_character_
+      )
+    })
+    
+    Sys.sleep(sleep_sec)
+  }
+  
+  bind_rows(result_list) %>%
+    rename(!!query_col_name := Query_ID) %>%
+    distinct()
+}
+```
+
+```{r}
+#----30. prepare ChEBI, PubChem, and HMDB query lists----
+# 這一步在做什麼？
+# 1. 從 external_ID_long_15ppm_top10ID 裡面整理出三種 ID：
+#    ChEBI_ID、PubChem_ID、HMDB_ID。
+# 2. ChEBI / PubChem 會直接用 KEGG REST 轉 KEGG。
+# 3. HMDB 會先輸出成檔案，等你用 MetaboAnalyst 或其他 mapping 工具轉成 KEGG 後再讀回。
+#
+# 這一步得到的 Data 代表什麼？
+# chebi_query_list_15ppm_top10：
+#   要轉 KEGG 的 ChEBI list。
+# pubchem_query_list_15ppm_top10：
+#   要轉 KEGG 的 PubChem list。
+# hmdb_ID_list_15ppm_top10：
+#   要拿去做 HMDB -> KEGG 的 HMDB list。
+
+chebi_query_list_15ppm_top10 <- external_ID_long_15ppm_top10ID %>%
+  filter(ID_type == "ChEBI_ID") %>%
+  select(External_ID, KEGG_query) %>%
+  distinct() %>%
+  arrange(External_ID)
+
+pubchem_query_list_15ppm_top10 <- external_ID_long_15ppm_top10ID %>%
+  filter(ID_type == "PubChem_ID") %>%
+  select(External_ID, KEGG_query) %>%
+  distinct() %>%
+  arrange(External_ID)
+
+hmdb_ID_list_15ppm_top10 <- external_ID_long_15ppm_top10ID %>%
+  filter(ID_type == "HMDB_ID") %>%
+  select(External_ID) %>%
+  distinct() %>%
+  arrange(External_ID)
+
+write_csv(
+  chebi_query_list_15ppm_top10,
+  file.path(output_path, "11_ChEBI_query_list_for_KEGG_15ppm_top10.csv")
+)
+
+write_csv(
+  pubchem_query_list_15ppm_top10,
+  file.path(output_path, "11_PubChem_query_list_for_KEGG_15ppm_top10.csv")
+)
+
+write_csv(
+  hmdb_ID_list_15ppm_top10,
+  file.path(output_path, "11_HMDB_ID_list_for_KEGG_conversion_15ppm_top10.csv")
+)
+
+ID_query_summary_15ppm_top10 <- tibble(
+  ID_type = c("ChEBI", "PubChem", "HMDB"),
+  Unique_ID_count = c(
+    nrow(chebi_query_list_15ppm_top10),
+    nrow(pubchem_query_list_15ppm_top10),
+    nrow(hmdb_ID_list_15ppm_top10)
+  )
+)
+
+write_csv(
+  ID_query_summary_15ppm_top10,
+  file.path(output_path, "11_ID_query_list_summary_15ppm_top10.csv")
+)
+
+ID_query_summary_15ppm_top10
+```
+
+```{r}
+#----31. convert ChEBI IDs to KEGG Compound IDs----
+# 這一步在做什麼？
+# 1. 把 ChEBI ID 轉成 KEGG Compound ID。
+# 2. 例如 chebi:12345 可能會轉成 Cxxxxx。
+#
+# 這一步得到的 Data 代表什麼？
+# chebi_to_kegg_15ppm_top10：
+#   一張 ChEBI -> KEGG 的對照表。
+#   KEGG_ID = Cxxxxx 表示成功對到 KEGG compound。
+#   KEGG_ID = NA 表示 KEGG 沒有對應。
+
+chebi_to_kegg_15ppm_top10 <- convert_kegg_id(
+  query_vec = chebi_query_list_15ppm_top10$KEGG_query,
+  query_col_name = "ChEBI_query",
+  sleep_sec = 0.4
+)
+
+write_csv(
+  chebi_to_kegg_15ppm_top10,
+  file.path(output_path, "12_ChEBI_to_KEGG_15ppm_top10.csv")
+)
+
+chebi_to_kegg_summary_15ppm_top10 <- chebi_to_kegg_15ppm_top10 %>%
+  summarise(
+    Total_ChEBI_query = n(),
+    ChEBI_with_KEGG = sum(!is.na(KEGG_ID)),
+    ChEBI_without_KEGG = sum(is.na(KEGG_ID)),
+    ChEBI_to_KEGG_rate = ChEBI_with_KEGG / Total_ChEBI_query
+  )
+
+write_csv(
+  chebi_to_kegg_summary_15ppm_top10,
+  file.path(output_path, "12_ChEBI_to_KEGG_Summary_15ppm_top10.csv")
+)
+
+chebi_to_kegg_summary_15ppm_top10
+```
+
+```{r}
+#----32. convert PubChem IDs to KEGG Compound IDs----
+# 這一步在做什麼？
+# 1. 把 PubChem ID 轉成 KEGG Compound ID。
+# 2. 例如 pubchem:12345 可能會轉成 Cxxxxx。
+#
+# 這一步得到的 Data 代表什麼？
+# pubchem_to_kegg_15ppm_top10：
+#   一張 PubChem -> KEGG 的對照表。
+#
+# 注意：
+# PubChem 有 CID / SID 差異。
+# ChemSpider 頁面抓到的 PubChem ID 不一定全部能被 KEGG 接住。
+# 所以 PubChem coverage 高，不代表 PubChem -> KEGG 成功率一定高。
+
+pubchem_to_kegg_15ppm_top10 <- convert_kegg_id(
+  query_vec = pubchem_query_list_15ppm_top10$KEGG_query,
+  query_col_name = "PubChem_query",
+  sleep_sec = 0.4
+)
+
+write_csv(
+  pubchem_to_kegg_15ppm_top10,
+  file.path(output_path, "13_PubChem_to_KEGG_15ppm_top10.csv")
+)
+
+pubchem_to_kegg_summary_15ppm_top10 <- pubchem_to_kegg_15ppm_top10 %>%
+  summarise(
+    Total_PubChem_query = n(),
+    PubChem_with_KEGG = sum(!is.na(KEGG_ID)),
+    PubChem_without_KEGG = sum(is.na(KEGG_ID)),
+    PubChem_to_KEGG_rate = PubChem_with_KEGG / Total_PubChem_query
+  )
+
+write_csv(
+  pubchem_to_kegg_summary_15ppm_top10,
+  file.path(output_path, "13_PubChem_to_KEGG_Summary_15ppm_top10.csv")
+)
+
+pubchem_to_kegg_summary_15ppm_top10
+```
+
+```{r}
+#33 HMDB to KEGG
+#打開這個工具頁面：https://www.metaboanalyst.ca/MetaboAnalyst/upload/ConvertView.xhtml
+#上傳 HMDB ID 清單:
+#Input type / Original ID type：HMDB ID /// Output / Target ID type：KEGG ID
+#要上傳或貼上的檔案是： 11_HMDB_ID_list_for_KEGG_conversion_15ppm_top10.csv
+#轉換完成後，下載結果表。把下載的檔案放回你的 output_path 資料夾。
+```
+
+```{r}
+#----33. import HMDB-to-KEGG conversion result from MetaboAnalyst----
+# 這一步在做什麼？
+# 1. 讀回你剛剛從 MetaboAnalyst 下載的 HMDB -> KEGG conversion 結果。
+# 2. 自動找欄位名稱中含有 HMDB 和 KEGG 的欄位。
+# 3. 整理成乾淨的 HMDB_ID / KEGG_ID 對照表。
+#
+# 這一步得到的 Data 代表什麼？
+# hmdb_to_kegg_15ppm_top10：
+#   一張 HMDB -> KEGG 的 mapping table。
+#   之後會跟 ChEBI -> KEGG、PubChem -> KEGG 的結果合併。
+
+hmdb_to_kegg_raw <- read_csv(
+  file.path(output_path, "14_HMDB_to_KEGG_MetaboAnalyst_raw.csv"),
+  show_col_types = FALSE
+)
+
+# 先看 MetaboAnalyst 輸出的欄位名稱
+names(hmdb_to_kegg_raw)
+
+# 自動找 HMDB 欄位
+hmdb_col <- names(hmdb_to_kegg_raw)[
+  str_detect(names(hmdb_to_kegg_raw), regex("HMDB", ignore_case = TRUE))
+][1]
+
+# 自動找 KEGG 欄位
+kegg_col <- names(hmdb_to_kegg_raw)[
+  str_detect(names(hmdb_to_kegg_raw), regex("KEGG", ignore_case = TRUE))
+][1]
+
+hmdb_col
+kegg_col
+```
+
+```{r}
+#----33-1. clean direct HMDB-to-KEGG conversion result----
+# 這一步在做什麼？
+# 1. 先整理 MetaboAnalyst 直接給的 HMDB -> KEGG 結果。
+# 2. 如果 HMDB 直接有 KEGG ID，就保留下來。
+# 3. 如果 KEGG 是空的，先保留，下一步會用 ChEBI / PubChem rescue。
+#
+# 這一步得到的 Data 代表什麼？
+# hmdb_to_kegg_direct_15ppm_top10：
+#   HMDB 直接對 KEGG 的結果。
+#   這還不是最終版，因為還沒做 ChEBI/PubChem rescue。
+
+hmdb_to_kegg_direct_15ppm_top10 <- hmdb_to_kegg_raw %>%
+  transmute(
+    HMDB_ID = as.character(.data[[hmdb_col]]),
+    KEGG_ID = as.character(.data[[kegg_col]])
+  ) %>%
+  separate_rows(KEGG_ID, sep = ";|,|\\s+") %>%
+  mutate(
+    HMDB_ID = str_squish(HMDB_ID),
+    KEGG_ID = str_squish(KEGG_ID),
+    HMDB_ID = na_if(HMDB_ID, ""),
+    KEGG_ID = na_if(KEGG_ID, ""),
+    KEGG_ID = str_replace(KEGG_ID, "^cpd:", "")
+  ) %>%
+  filter(!is.na(HMDB_ID)) %>%
+  distinct()
+
+write_csv(
+  hmdb_to_kegg_direct_15ppm_top10,
+  file.path(output_path, "14_HMDB_to_KEGG_direct_15ppm_top10.csv")
+)
+
+hmdb_to_kegg_direct_15ppm_top10 %>%
+  summarise(
+    Total_HMDB_rows = n(),
+    Direct_HMDB_with_KEGG = sum(!is.na(KEGG_ID)),
+    Direct_HMDB_without_KEGG = sum(is.na(KEGG_ID)),
+    Direct_HMDB_to_KEGG_rate = Direct_HMDB_with_KEGG / Total_HMDB_rows
+  )
+```
+
+```{r}
+#----33-2. rescue HMDB entries without KEGG using MetaboAnalyst ChEBI/PubChem columns----
+# 這一步在做什麼？
+# 1. 有些 HMDB ID 在 MetaboAnalyst 中沒有直接對到 KEGG ID。
+# 2. 但 MetaboAnalyst 可能提供了對應的 ChEBI 或 PubChem ID。
+# 3. 這一步會把這些 ChEBI / PubChem ID 拿出來，再用 KEGG REST 嘗試轉成 KEGG ID。
+# 4. 最後整理成 HMDB rescue mapping table。
+#
+# 這一步得到的 Data 代表什麼？
+# hmdb_rescue_query_15ppm_top10：
+#   HMDB 沒有直接 KEGG，但有 ChEBI / PubChem 可以救援轉換的 query table。
+# hmdb_rescue_to_kegg_15ppm_top10：
+#   用 ChEBI / PubChem rescue 後得到的 HMDB -> KEGG mapping result。
+#
+# 注意：
+# MetaboAnalyst 的 ChEBI / PubChem 欄位可能只有數字。
+# KEGG REST 需要 chebi:xxxxx 或 pubchem:xxxxx。
+# 所以這裡會強制補上 chebi: / pubchem: 前綴。
+
+hmdb_rescue_source_15ppm_top10 <- hmdb_to_kegg_raw %>%
+  transmute(
+    HMDB_ID = as.character(HMDB),
+    Direct_KEGG = as.character(KEGG),
+    Rescue_ChEBI = as.character(ChEBI),
+    Rescue_PubChem = as.character(PubChem)
+  ) %>%
+  mutate(
+    HMDB_ID = str_squish(HMDB_ID),
+    Direct_KEGG = str_squish(Direct_KEGG),
+    Rescue_ChEBI = str_squish(Rescue_ChEBI),
+    Rescue_PubChem = str_squish(Rescue_PubChem),
+    
+    Direct_KEGG = na_if(Direct_KEGG, ""),
+    Direct_KEGG = na_if(Direct_KEGG, "NA"),
+    Direct_KEGG = na_if(Direct_KEGG, "-"),
+    
+    Rescue_ChEBI = na_if(Rescue_ChEBI, ""),
+    Rescue_ChEBI = na_if(Rescue_ChEBI, "NA"),
+    Rescue_ChEBI = na_if(Rescue_ChEBI, "-"),
+    
+    Rescue_PubChem = na_if(Rescue_PubChem, ""),
+    Rescue_PubChem = na_if(Rescue_PubChem, "NA"),
+    Rescue_PubChem = na_if(Rescue_PubChem, "-")
+  ) %>%
+  filter(
+    !is.na(HMDB_ID),
+    is.na(Direct_KEGG),
+    !is.na(Rescue_ChEBI) | !is.na(Rescue_PubChem)
+  )
+
+hmdb_rescue_chebi_query <- hmdb_rescue_source_15ppm_top10 %>%
+  select(HMDB_ID, Rescue_ChEBI) %>%
+  separate_rows(Rescue_ChEBI, sep = ";|,|\\s+") %>%
+  mutate(
+    Rescue_ChEBI = str_squish(Rescue_ChEBI),
+    Rescue_ChEBI = na_if(Rescue_ChEBI, ""),
+    Rescue_ChEBI = na_if(Rescue_ChEBI, "NA"),
+    Rescue_ChEBI = na_if(Rescue_ChEBI, "-"),
+    
+    Rescue_ChEBI_number = str_extract(Rescue_ChEBI, "\\d+"),
+    
+    Rescue_query = if_else(
+      !is.na(Rescue_ChEBI_number),
+      paste0("chebi:", Rescue_ChEBI_number),
+      NA_character_
+    ),
+    
+    Rescue_source = "HMDB_rescue_ChEBI"
+  ) %>%
+  filter(!is.na(Rescue_query)) %>%
+  select(
+    HMDB_ID,
+    Rescue_source,
+    Rescue_ID = Rescue_ChEBI,
+    Rescue_query
+  )
+
+hmdb_rescue_pubchem_query <- hmdb_rescue_source_15ppm_top10 %>%
+  select(HMDB_ID, Rescue_PubChem) %>%
+  separate_rows(Rescue_PubChem, sep = ";|,|\\s+") %>%
+  mutate(
+    Rescue_PubChem = str_squish(Rescue_PubChem),
+    Rescue_PubChem = na_if(Rescue_PubChem, ""),
+    Rescue_PubChem = na_if(Rescue_PubChem, "NA"),
+    Rescue_PubChem = na_if(Rescue_PubChem, "-"),
+    
+    Rescue_PubChem_number = str_extract(Rescue_PubChem, "\\d+"),
+    
+    Rescue_query = if_else(
+      !is.na(Rescue_PubChem_number),
+      paste0("pubchem:", Rescue_PubChem_number),
+      NA_character_
+    ),
+    
+    Rescue_source = "HMDB_rescue_PubChem"
+  ) %>%
+  filter(!is.na(Rescue_query)) %>%
+  select(
+    HMDB_ID,
+    Rescue_source,
+    Rescue_ID = Rescue_PubChem,
+    Rescue_query
+  )
+
+hmdb_rescue_query_15ppm_top10 <- bind_rows(
+  hmdb_rescue_chebi_query,
+  hmdb_rescue_pubchem_query
+) %>%
+  distinct()
+
+write_csv(
+  hmdb_rescue_query_15ppm_top10,
+  file.path(output_path, "14_HMDB_rescue_ChEBI_PubChem_query_15ppm_top10.csv")
+)
+
+hmdb_rescue_kegg_raw_15ppm_top10 <- convert_kegg_id(
+  query_vec = hmdb_rescue_query_15ppm_top10$Rescue_query,
+  query_col_name = "Rescue_query",
+  sleep_sec = 0.4
+)
+
+hmdb_rescue_to_kegg_15ppm_top10 <- hmdb_rescue_query_15ppm_top10 %>%
+  left_join(
+    hmdb_rescue_kegg_raw_15ppm_top10,
+    by = "Rescue_query",
+    relationship = "many-to-many"
+  ) %>%
+  distinct()
+
+write_csv(
+  hmdb_rescue_to_kegg_15ppm_top10,
+  file.path(output_path, "14_HMDB_rescue_to_KEGG_15ppm_top10.csv")
+)
+
+hmdb_rescue_summary_15ppm_top10 <- hmdb_rescue_to_kegg_15ppm_top10 %>%
+  summarise(
+    Rescue_query_rows = n(),
+    Rescue_rows_with_KEGG = sum(!is.na(KEGG_ID)),
+    Rescue_rows_without_KEGG = sum(is.na(KEGG_ID)),
+    Rescue_unique_HMDB_with_KEGG = n_distinct(HMDB_ID[!is.na(KEGG_ID)]),
+    Rescue_unique_KEGG_IDs = n_distinct(KEGG_ID, na.rm = TRUE),
+    Rescue_KEGG_hit_rate = Rescue_rows_with_KEGG / Rescue_query_rows
+  )
+
+write_csv(
+  hmdb_rescue_summary_15ppm_top10,
+  file.path(output_path, "14_HMDB_rescue_to_KEGG_Summary_15ppm_top10.csv")
+)
+
+hmdb_rescue_summary_15ppm_top10
+```
+
+```{r}
+#----33-3. combine direct HMDB-to-KEGG and rescue HMDB-to-KEGG mapping----
+# 這一步在做什麼？
+# 1. 合併兩種 HMDB -> KEGG 結果：
+#    A. MetaboAnalyst 直接給的 HMDB -> KEGG
+#    B. HMDB 沒有直接 KEGG，但用 ChEBI / PubChem rescue 出來的 KEGG
+# 2. 只保留成功對到 KEGG_ID 的 rows。
+# 3. KEGG_ID 是 NA 的 rows 直接刪掉，不進入下一層分析。
+#
+# 這一步得到的 Data 代表什麼？
+# hmdb_to_kegg_15ppm_top10：
+#   最終版 HMDB -> KEGG mapping table。
+#   這張表只包含成功對到 KEGG ID 的 HMDB。
+#
+# 注意：
+# 後面的 #34 會用這張表，不再使用 direct-only 或 rescue raw table。
+
+hmdb_direct_success_15ppm_top10 <- hmdb_to_kegg_direct_15ppm_top10 %>%
+  filter(!is.na(KEGG_ID)) %>%
+  mutate(
+    HMDB_KEGG_source = "HMDB_direct"
+  )
+
+hmdb_rescue_success_15ppm_top10 <- hmdb_rescue_to_kegg_15ppm_top10 %>%
+  filter(!is.na(KEGG_ID)) %>%
+  transmute(
+    HMDB_ID,
+    KEGG_ID,
+    HMDB_KEGG_source = Rescue_source
+  )
+
+hmdb_to_kegg_15ppm_top10 <- bind_rows(
+  hmdb_direct_success_15ppm_top10,
+  hmdb_rescue_success_15ppm_top10
+) %>%
+  mutate(
+    HMDB_ID = as.character(HMDB_ID),
+    KEGG_ID = as.character(KEGG_ID),
+    KEGG_ID = str_replace(KEGG_ID, "^cpd:", ""),
+    KEGG_ID = str_squish(KEGG_ID),
+    KEGG_ID = na_if(KEGG_ID, "")
+  ) %>%
+  filter(!is.na(HMDB_ID), !is.na(KEGG_ID)) %>%
+  distinct()
+
+write_csv(
+  hmdb_to_kegg_15ppm_top10,
+  file.path(output_path, "14_HMDB_to_KEGG_direct_plus_rescue_mapped_only_15ppm_top10.csv")
+)
+
+hmdb_to_kegg_summary_15ppm_top10 <- hmdb_to_kegg_15ppm_top10 %>%
+  summarise(
+    HMDB_with_KEGG = n_distinct(HMDB_ID),
+    Unique_KEGG_IDs = n_distinct(KEGG_ID),
+    Mapping_rows = n()
+  )
+
+write_csv(
+  hmdb_to_kegg_summary_15ppm_top10,
+  file.path(output_path, "14_HMDB_to_KEGG_direct_plus_rescue_Summary_15ppm_top10.csv")
+)
+
+hmdb_to_kegg_summary_15ppm_top10
+```
+
+```{r}
+#----34. merge ChEBI-, PubChem-, and HMDB-derived KEGG IDs back to external ID long table----
+# 這一步在做什麼？
+# 1. 把三條 mapping 接回 external_ID_long_15ppm_top10ID：
+#    ChEBI   -> KEGG
+#    PubChem -> KEGG
+#    HMDB direct/rescue -> KEGG
+# 2. 只保留成功對到 KEGG_ID 的 rows。
+# 3. KEGG_ID 是 NA 的 rows 直接刪掉。
+#
+# 這一步得到的 Data 代表什麼？
+# external_ID_to_KEGG_15ppm_top10：
+#   ID-level KEGG bridge table。
+#   每一列代表某個 external ID 成功對到一個 KEGG_ID。
+#
+# 注意：
+# 這張表已經沒有 KEGG_ID = NA 的 rows。
+# 所以下一層資料不會再包含「對不到 KEGG 的 metabolite」。
+
+chebi_kegg_bridge_15ppm_top10 <- external_ID_long_15ppm_top10ID %>%
+  filter(ID_type == "ChEBI_ID") %>%
+  left_join(
+    chebi_to_kegg_15ppm_top10,
+    by = c("KEGG_query" = "ChEBI_query"),
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    KEGG_source = "ChEBI",
+    HMDB_KEGG_source = NA_character_
+  ) %>%
+  filter(!is.na(KEGG_ID))
+
+pubchem_kegg_bridge_15ppm_top10 <- external_ID_long_15ppm_top10ID %>%
+  filter(ID_type == "PubChem_ID") %>%
+  left_join(
+    pubchem_to_kegg_15ppm_top10,
+    by = c("KEGG_query" = "PubChem_query"),
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    KEGG_source = "PubChem",
+    HMDB_KEGG_source = NA_character_
+  ) %>%
+  filter(!is.na(KEGG_ID))
+
+hmdb_kegg_bridge_15ppm_top10 <- external_ID_long_15ppm_top10ID %>%
+  filter(ID_type == "HMDB_ID") %>%
+  left_join(
+    hmdb_to_kegg_15ppm_top10,
+    by = c("External_ID" = "HMDB_ID"),
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    KEGG_source = "HMDB"
+  ) %>%
+  filter(!is.na(KEGG_ID))
+
+external_ID_to_KEGG_15ppm_top10 <- bind_rows(
+  chebi_kegg_bridge_15ppm_top10,
+  pubchem_kegg_bridge_15ppm_top10,
+  hmdb_kegg_bridge_15ppm_top10
+) %>%
+  mutate(
+    KEGG_ID = as.character(KEGG_ID),
+    KEGG_ID = str_replace(KEGG_ID, "^cpd:", ""),
+    KEGG_ID = str_squish(KEGG_ID),
+    KEGG_ID = na_if(KEGG_ID, "")
+  ) %>%
+  filter(!is.na(KEGG_ID)) %>%
+  select(
+    Mode,
+    Compound,
+    `Compound ID`,
+    CSID,
+    ID_type,
+    External_ID,
+    KEGG_query,
+    KEGG_ID,
+    KEGG_source,
+    HMDB_KEGG_source,
+    Score,
+    `Fragmentation Score`,
+    `Mass Error (ppm)`,
+    Abs_Mass_Error_ppm,
+    `Isotope Similarity`,
+    Candidate_rank_within_Compound,
+    External_ID_rank_within_Compound,
+    Total_candidates_within_Compound,
+    Total_external_ID_within_Compound
+  ) %>%
+  distinct()
+
+write_csv(
+  external_ID_to_KEGG_15ppm_top10,
+  file.path(output_path, "15_External_ID_to_KEGG_bridge_mapped_only_15ppm_top10.csv")
+)
+
+external_ID_to_KEGG_summary_15ppm_top10 <- external_ID_to_KEGG_15ppm_top10 %>%
+  group_by(Mode, KEGG_source) %>%
+  summarise(
+    Rows_with_KEGG = n(),
+    Unique_KEGG_IDs = n_distinct(KEGG_ID),
+    .groups = "drop"
+  )
+
+write_csv(
+  external_ID_to_KEGG_summary_15ppm_top10,
+  file.path(output_path, "15_External_ID_to_KEGG_bridge_Summary_mapped_only_15ppm_top10.csv")
+)
+
+external_ID_to_KEGG_summary_15ppm_top10
+```
+
+```{r}
+#----35. create Compound-level KEGG annotation table from mapped KEGG rows only----
+# 這一步在做什麼？
+# 1. external_ID_to_KEGG_15ppm_top10 是 ID-level table。
+#    一個 Compound 可能有多列，因為它可能透過多個 ChEBI / HMDB / PubChem 對到 KEGG。
+# 2. 這一步把 ID-level table collapse 回 Compound-level。
+# 3. 因為 #34 已經刪掉 KEGG_ID = NA，所以這一步只會保留有 KEGG_ID 的 features。
+#
+# 這一步得到的 Data 代表什麼？
+# compound_KEGG_annotation_15ppm_top10：
+#   Compound-level KEGG annotation table。
+#   每個 Compound 一列，且一定至少有一個 KEGG_ID。
+#
+# 注意：
+# KEGG_mapping_status：
+#   Single_KEGG   = 這個 feature 只有一個 KEGG ID，較好解讀
+#   Multiple_KEGG = 這個 feature 對到多個 KEGG ID，有 annotation ambiguity
+#
+# 這裡不會再有 No_KEGG，因為 No_KEGG 已經被刪掉。
+
+collapse_unique_ids <- function(x) {
+  
+  x <- x %>%
+    na.omit() %>%
+    as.character() %>%
+    paste(collapse = ";") %>%
+    str_split(";") %>%
+    unlist() %>%
+    str_squish()
+  
+  x <- x[x != ""]
+  x <- unique(x)
+  
+  if (length(x) == 0) {
+    NA_character_
+  } else {
+    paste(x, collapse = ";")
+  }
+}
+
+count_semicolon_ids <- function(x) {
+  
+  ifelse(
+    is.na(x) | x == "",
+    0,
+    str_count(x, ";") + 1
+  )
+}
+
+compound_KEGG_annotation_15ppm_top10 <- external_ID_to_KEGG_15ppm_top10 %>%
+  group_by(Mode, Compound) %>%
+  summarise(
+    KEGG_ID = collapse_unique_ids(KEGG_ID),
+    KEGG_source = collapse_unique_ids(KEGG_source),
+    HMDB_KEGG_source = collapse_unique_ids(HMDB_KEGG_source),
+    ChEBI_ID = collapse_unique_ids(ifelse(ID_type == "ChEBI_ID", External_ID, NA_character_)),
+    Final_HMDB_ID = collapse_unique_ids(ifelse(ID_type == "HMDB_ID", External_ID, NA_character_)),
+    PubChem_ID = collapse_unique_ids(ifelse(ID_type == "PubChem_ID", External_ID, NA_character_)),
+    CSID = collapse_unique_ids(CSID),
+    `Compound ID` = collapse_unique_ids(`Compound ID`),
+    Best_abs_mass_error_ppm = min(Abs_Mass_Error_ppm, na.rm = TRUE),
+    Best_score = max(Score, na.rm = TRUE),
+    Best_fragmentation_score = max(`Fragmentation Score`, na.rm = TRUE),
+    Max_total_candidates_before_top10 = max(Total_candidates_within_Compound, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    n_KEGG_ID = count_semicolon_ids(KEGG_ID),
+    KEGG_mapping_status = case_when(
+      n_KEGG_ID == 1 ~ "Single_KEGG",
+      n_KEGG_ID > 1 ~ "Multiple_KEGG"
+    )
+  ) %>%
+  filter(!is.na(KEGG_ID))
+
+write_csv(
+  compound_KEGG_annotation_15ppm_top10,
+  file.path(output_path, "16_Compound_KEGG_annotation_mapped_only_15ppm_top10.csv")
+)
+
+compound_KEGG_annotation_summary_15ppm_top10 <- compound_KEGG_annotation_15ppm_top10 %>%
+  group_by(Mode, KEGG_mapping_status) %>%
+  summarise(
+    Features = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(Mode) %>%
+  mutate(
+    Total_KEGG_mapped_features = sum(Features),
+    Feature_rate = Features / Total_KEGG_mapped_features
+  ) %>%
+  ungroup()
+
+write_csv(
+  compound_KEGG_annotation_summary_15ppm_top10,
+  file.path(output_path, "16_Compound_KEGG_annotation_Summary_mapped_only_15ppm_top10.csv")
+)
+
+compound_KEGG_annotation_summary_15ppm_top10
+```
+
+```{r}
+#----36. merge KEGG-mapped annotation back to measurement tables----
+# 這一步在做什麼？
+# 1. 把有 KEGG_ID 的 Compound-level annotation 對回 measurement table。
+# 2. 沒有 KEGG_ID 的 metabolites 不進入主分析。
+#
+# 這一步得到的 Data 代表什麼？
+# NEG_measure_with_KEGG_15ppm_top10：
+#   NEG mode 中，有 intensity 且有 KEGG_ID 的主分析資料。
+# POS_measure_with_KEGG_15ppm_top10：
+#   POS mode 中，有 intensity 且有 KEGG_ID 的主分析資料。
+#
+# 注意：
+# 這兩張表是後面 PCA、fold-change、individual metabolite、KEGG pathway input 的主分析資料。
+# 這裡已經不包含 KEGG_ID = NA 的 features。
+
+NEG_measure_with_KEGG_15ppm_top10 <- NEG_measure_rm %>%
+  left_join(
+    compound_KEGG_annotation_15ppm_top10 %>%
+      filter(Mode == "NEG") %>%
+      select(-Mode),
+    by = "Compound"
+  ) %>%
+  filter(!is.na(KEGG_ID))
+
+POS_measure_with_KEGG_15ppm_top10 <- POS_measure_rm %>%
+  left_join(
+    compound_KEGG_annotation_15ppm_top10 %>%
+      filter(Mode == "POS") %>%
+      select(-Mode),
+    by = "Compound"
+  ) %>%
+  filter(!is.na(KEGG_ID))
+
+write_csv(
+  NEG_measure_with_KEGG_15ppm_top10,
+  file.path(output_path, "17_NEG_measurement_with_KEGG_mapped_only_15ppm_top10.csv")
+)
+
+write_csv(
+  POS_measure_with_KEGG_15ppm_top10,
+  file.path(output_path, "17_POS_measurement_with_KEGG_mapped_only_15ppm_top10.csv")
+)
+```
+
+```{r}
+#----37. summarize final KEGG-mapped measurement features----
+# 這一步在做什麼？
+# 1. 檢查最後進入主分析的 KEGG-mapped measurement features 有多少。
+# 2. 區分 Single_KEGG 和 Multiple_KEGG。
+#
+# 這一步得到的 Data 代表什麼？
+# final_KEGG_mapping_summary_15ppm_top10：
+#   最終主分析中，POS / NEG 有多少 features 有 KEGG_ID。
+#
+# 注意：
+# 因為前面已經刪掉 KEGG_ID = NA，
+# 所以這裡不會有 No_KEGG。
+
+final_KEGG_mapping_summary_15ppm_top10 <- bind_rows(
+  NEG_measure_with_KEGG_15ppm_top10 %>% mutate(Mode = "NEG"),
+  POS_measure_with_KEGG_15ppm_top10 %>% mutate(Mode = "POS")
+) %>%
+  group_by(Mode, KEGG_mapping_status) %>%
+  summarise(
+    Features = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(Mode) %>%
+  mutate(
+    Total_KEGG_mapped_features = sum(Features),
+    Feature_rate = Features / Total_KEGG_mapped_features
+  ) %>%
+  ungroup()
+
+write_csv(
+  final_KEGG_mapping_summary_15ppm_top10,
+  file.path(output_path, "17_Final_KEGG_mapping_Summary_mapped_only_15ppm_top10.csv")
+)
+
+final_KEGG_mapping_summary_15ppm_top10
+```
+
+```{r}
+#----38. export unique KEGG IDs for pathway analysis----
+# 這一步在做什麼？
+# 1. 從最後的 measurement table 中抽出 unique KEGG_ID。
+# 2. 如果一個 feature 有多個 KEGG_ID，這裡會拆開成多列。
+# 3. 這份表可以拿去做 KEGG pathway / enrichment analysis。
+#
+# 這一步得到的 Data 代表什麼？
+# unique_KEGG_IDs_for_pathway_15ppm_top10：
+#   最後可以拿去做 KEGG pathway analysis 的 KEGG compound ID list。
+
+unique_KEGG_IDs_for_pathway_15ppm_top10 <- bind_rows(
+  NEG_measure_with_KEGG_15ppm_top10 %>% mutate(Mode = "NEG"),
+  POS_measure_with_KEGG_15ppm_top10 %>% mutate(Mode = "POS")
+) %>%
+  select(Mode, Compound, KEGG_ID) %>%
+  separate_rows(KEGG_ID, sep = ";") %>%
+  mutate(
+    KEGG_ID = str_squish(KEGG_ID),
+    KEGG_ID = na_if(KEGG_ID, "")
+  ) %>%
+  filter(!is.na(KEGG_ID)) %>%
+  distinct(Mode, Compound, KEGG_ID)
+
+write_csv(
+  unique_KEGG_IDs_for_pathway_15ppm_top10,
+  file.path(output_path, "18_Unique_KEGG_IDs_for_pathway_mapped_only_15ppm_top10.csv")
+)
+
+unique_KEGG_IDs_for_pathway_summary_15ppm_top10 <- unique_KEGG_IDs_for_pathway_15ppm_top10 %>%
+  group_by(Mode) %>%
+  summarise(
+    Features_with_KEGG = n_distinct(Compound),
+    Unique_KEGG_IDs = n_distinct(KEGG_ID),
+    .groups = "drop"
+  )
+
+write_csv(
+  unique_KEGG_IDs_for_pathway_summary_15ppm_top10,
+  file.path(output_path, "18_Unique_KEGG_IDs_for_pathway_Summary_mapped_only_15ppm_top10.csv")
+)
+
+unique_KEGG_IDs_for_pathway_summary_15ppm_top10
+```
+
+```{r}
+hmdb_to_kegg_summary_15ppm_top10
+final_KEGG_mapping_summary_15ppm_top10
+unique_KEGG_IDs_for_pathway_summary_15ppm_top10
+```
+
+```{r}
+#----38. export KEGG IDs for pathway analysis with ambiguity control----
+# 這一步在做什麼？
+# 1. 從最後的 KEGG-mapped measurement table 中輸出 KEGG pathway input。
+# 2. 但不直接把所有 Multiple_KEGG 拆開當成獨立代謝物。
+# 3. 產生三個版本：
+#    A. Single_KEGG only：最保守，建議作為正式主分析。
+#    B. Best_KEGG per feature：每個 feature 只保留一個 KEGG，作探索分析。
+#    C. All KEGG expanded：全部展開，只作 QC，不建議直接做正式 enrichment。
+#
+# 這一步得到的 Data 代表什麼？
+# single_KEGG_for_pathway_15ppm_top10：
+#   只包含 Single_KEGG features，最乾淨。
+# best_KEGG_per_feature_for_pathway_15ppm_top10：
+#   Single + Multiple features，但每個 feature 只選一個 KEGG ID。
+# all_KEGG_expanded_QC_15ppm_top10：
+#   所有 KEGG ID 展開版，只用來看 ambiguity，不作正式主分析。
+
+measure_with_KEGG_all_15ppm_top10 <- bind_rows(
+  NEG_measure_with_KEGG_15ppm_top10 %>% mutate(Mode = "NEG"),
+  POS_measure_with_KEGG_15ppm_top10 %>% mutate(Mode = "POS")
+) %>%
+  mutate(
+    Feature_ID = paste(Mode, Compound, sep = "_")
+  )
+
+#----38A. Conservative pathway input: Single_KEGG only----
+# 這份是最保守的 KEGG pathway input。
+# 每個 feature 只對到一個 KEGG ID，所以不會有一個訊號被複製成多個 KEGG 的問題。
+
+single_KEGG_for_pathway_15ppm_top10 <- measure_with_KEGG_all_15ppm_top10 %>%
+  filter(KEGG_mapping_status == "Single_KEGG") %>%
+  select(
+    Mode,
+    Feature_ID,
+    Compound,
+    KEGG_ID,
+    KEGG_source,
+    KEGG_mapping_status,
+    Best_abs_mass_error_ppm,
+    Best_score,
+    Best_fragmentation_score
+  ) %>%
+  distinct()
+
+write_csv(
+  single_KEGG_for_pathway_15ppm_top10,
+  file.path(output_path, "18A_Single_KEGG_only_for_pathway_15ppm_top10.csv")
+)
+
+single_KEGG_for_pathway_summary_15ppm_top10 <- single_KEGG_for_pathway_15ppm_top10 %>%
+  group_by(Mode) %>%
+  summarise(
+    Single_KEGG_features = n_distinct(Feature_ID),
+    Unique_KEGG_IDs = n_distinct(KEGG_ID),
+    .groups = "drop"
+  )
+
+write_csv(
+  single_KEGG_for_pathway_summary_15ppm_top10,
+  file.path(output_path, "18A_Single_KEGG_only_for_pathway_Summary_15ppm_top10.csv")
+)
+
+single_KEGG_for_pathway_summary_15ppm_top10
+
+
+#----38B. Exploratory pathway input: choose one best KEGG per feature----
+# 這份是探索版。
+# 對 Multiple_KEGG features，每個 feature 只選一個 KEGG ID。
+# 選擇邏輯：
+# 1. 優先 KEGG_source = ChEBI
+# 2. 再來 HMDB
+# 3. 最後 PubChem
+# 4. 若仍有多個，保留排序第一個
+#
+# 風險：
+# best KEGG 不一定是真的身分，只是為了避免一個 feature 被重複計數。
+
+best_KEGG_per_feature_for_pathway_15ppm_top10 <- external_ID_to_KEGG_15ppm_top10 %>%
+  filter(!is.na(KEGG_ID)) %>%
+  mutate(
+    Feature_ID = paste(Mode, Compound, sep = "_"),
+    KEGG_source_priority = case_when(
+      KEGG_source == "ChEBI" ~ 1,
+      KEGG_source == "HMDB" ~ 2,
+      KEGG_source == "PubChem" ~ 3,
+      TRUE ~ 9
+    ),
+    Score_for_rank = replace_na(Score, -Inf),
+    Fragmentation_for_rank = replace_na(`Fragmentation Score`, -Inf),
+    Isotope_for_rank = replace_na(`Isotope Similarity`, -Inf)
+  ) %>%
+  group_by(Mode, Feature_ID, Compound) %>%
+  arrange(
+    KEGG_source_priority,
+    Abs_Mass_Error_ppm,
+    desc(Fragmentation_for_rank),
+    desc(Score_for_rank),
+    desc(Isotope_for_rank),
+    .by_group = TRUE
+  ) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(
+    Mode,
+    Feature_ID,
+    Compound,
+    KEGG_ID,
+    KEGG_source,
+    ID_type,
+    External_ID,
+    Best_abs_mass_error_ppm = Abs_Mass_Error_ppm,
+    Score,
+    `Fragmentation Score`,
+    `Isotope Similarity`
+  ) %>%
+  distinct()
+
+write_csv(
+  best_KEGG_per_feature_for_pathway_15ppm_top10,
+  file.path(output_path, "18B_Best_KEGG_per_feature_for_pathway_15ppm_top10.csv")
+)
+
+best_KEGG_per_feature_summary_15ppm_top10 <- best_KEGG_per_feature_for_pathway_15ppm_top10 %>%
+  group_by(Mode) %>%
+  summarise(
+    Features_with_best_KEGG = n_distinct(Feature_ID),
+    Unique_KEGG_IDs = n_distinct(KEGG_ID),
+    .groups = "drop"
+  )
+
+write_csv(
+  best_KEGG_per_feature_summary_15ppm_top10,
+  file.path(output_path, "18B_Best_KEGG_per_feature_for_pathway_Summary_15ppm_top10.csv")
+)
+
+best_KEGG_per_feature_summary_15ppm_top10
+
+
+#----38C. QC only: all KEGG IDs expanded----
+# 這份會把 Multiple_KEGG 全部拆開。
+# 不建議直接拿去作正式 enrichment。
+# 用途：
+# 1. 看有多少 ambiguity
+# 2. 檢查哪些 features 對到太多 KEGG
+# 3. 作為補充資料
+
+all_KEGG_expanded_QC_15ppm_top10 <- measure_with_KEGG_all_15ppm_top10 %>%
+  select(
+    Mode,
+    Feature_ID,
+    Compound,
+    KEGG_ID,
+    KEGG_mapping_status,
+    KEGG_source,
+    Best_abs_mass_error_ppm,
+    Best_score,
+    Best_fragmentation_score
+  ) %>%
+  separate_rows(KEGG_ID, sep = ";") %>%
+  mutate(
+    KEGG_ID = str_squish(KEGG_ID),
+    KEGG_ID = na_if(KEGG_ID, "")
+  ) %>%
+  filter(!is.na(KEGG_ID)) %>%
+  distinct()
+
+write_csv(
+  all_KEGG_expanded_QC_15ppm_top10,
+  file.path(output_path, "18C_All_KEGG_expanded_QC_only_15ppm_top10.csv")
+)
+
+all_KEGG_expanded_QC_summary_15ppm_top10 <- all_KEGG_expanded_QC_15ppm_top10 %>%
+  group_by(Mode) %>%
+  summarise(
+    Features_with_KEGG = n_distinct(Feature_ID),
+    Expanded_KEGG_rows = n(),
+    Unique_KEGG_IDs = n_distinct(KEGG_ID),
+    Mean_KEGG_per_feature = Expanded_KEGG_rows / Features_with_KEGG,
+    .groups = "drop"
+  )
+
+write_csv(
+  all_KEGG_expanded_QC_summary_15ppm_top10,
+  file.path(output_path, "18C_All_KEGG_expanded_QC_only_Summary_15ppm_top10.csv")
+)
+
+all_KEGG_expanded_QC_summary_15ppm_top10
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+

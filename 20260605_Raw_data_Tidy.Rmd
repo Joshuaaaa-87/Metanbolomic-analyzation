@@ -1,0 +1,2195 @@
+#Rewrite Verion (From2026/6/3--)
+# This script is for noise reduction of the annotated data of metabolomic
+# Threshold, Mass Error <= 20 ppm
+
+#跟ChatGPT一起溝通後的邏輯
+#1. 5x Blank filter measurement
+#2. 用 Compound 把 identification filter 成同一批 features
+#3. ChemSpider 抓 external IDs：ChEBI / HMDB / PubChem
+#4. external IDs 合併回 identification
+#5. Mass error ≤ 20 ppm filter
+#6. 用 20 ppm 後資料建立 ChEBI / PubChem / HMDB conversion input
+
+
+
+```{r}
+
+#----0. Install packages if needed----
+
+# CRAN packages
+cran_pkgs <- c("rvest", "matrixStats", "BiocManager")
+
+for (pkg in cran_pkgs) {
+  
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+# Bioconductor package
+if (!requireNamespace("Rdisop", quietly = TRUE)) {
+  BiocManager::install("Rdisop")
+}
+
+if (!requireNamespace("FactoMineR", quietly = TRUE)) {
+  BiocManager::install("FactoMineR")
+}
+
+```
+
+```{r}
+
+#----1. library----
+library(tidyverse)
+library(rvest)
+library(matrixStats) # for median calculation
+library(Rdisop)
+library(FactoMineR)
+library(factoextra)
+library(ggcorrplot)
+
+```
+
+```{r}
+
+#----2. create the output folder----
+
+base_path <- "/Users/wangjie/Desktop/LAB/1_Data/5.1_ (Re-analyze) Metabolomic/0_Raw Data"
+
+output_folder <- "1_Data(reanalysis)_Celldeath_Sup_Each_Filtered"
+
+output_path <- file.path(base_path, output_folder)
+
+dir.create(output_path, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+```{r}
+
+#----3. import raw data----
+
+raw_path <- "/Users/wangjie/Desktop/LAB/1_Data/5.1_ (Re-analyze) Metabolomic/0_Raw Data/0_QI report"
+
+POS_iden <- read_csv(file.path(raw_path, "POS_Compound Identification.csv"))
+NEG_iden <- read_csv(file.path(raw_path, "NEG_Compound Identification.csv"))
+POS_measure <- read_csv(file.path(raw_path, "POS_Compound Measurement.csv"))
+NEG_measure <- read_csv(file.path(raw_path, "NEG_Compound Measurement.csv"))
+
+```
+```{r}
+#----4. tidy measurement raw data----
+
+sample_colnames <- c(
+  "Compound", 
+  "DMSO-1", "DMSO-2", "DMSO-3", 
+  "STS-1", "STS-2", "STS-3", 
+  "Fas-1", "Fas-2", "Fas-3",
+  "RSL-1", "RSL-2", "RSL-3",
+  "Nec-1", "Nec-2", "Nec-3",
+  "Blank"
+)
+
+# check selected columns
+colnames(POS_measure)[c(1, 14:29)]
+colnames(NEG_measure)[c(1, 14:29)]
+
+# clean POS measurement data
+POS_measure_clean <- POS_measure[-c(1, 2), c(1, 14:29)]
+colnames(POS_measure_clean) <- sample_colnames
+POS_measure_clean[, 2:17] <- lapply(POS_measure_clean[, 2:17], as.numeric)
+
+# clean NEG measurement data
+NEG_measure_clean <- NEG_measure[-c(1, 2), c(1, 14:29)]
+colnames(NEG_measure_clean) <- sample_colnames
+NEG_measure_clean[, 2:17] <- lapply(NEG_measure_clean[, 2:17], as.numeric)
+```
+```{r}
+#----5. calculate group mean and condition-specific blank filter----
+#子維原本將所有的CellDeath Sup 一起算成個Mean再去求出Median 然後去跟Blank大於10倍的數字做Filter
+#我改成分開的，把每一單讀calculate成Mean，再拿去跟Blank 大於{5}倍率的作Filtered
+
+blank_fold <- 5   #子維原本是10倍
+
+POS_measure_clean <- POS_measure_clean %>%
+  mutate(
+    DMSO_mean = rowMeans(across(c("DMSO-1", "DMSO-2", "DMSO-3")), na.rm = TRUE),
+    STS_mean  = rowMeans(across(c("STS-1", "STS-2", "STS-3")), na.rm = TRUE),
+    Fas_mean  = rowMeans(across(c("Fas-1", "Fas-2", "Fas-3")), na.rm = TRUE),
+    RSL_mean  = rowMeans(across(c("RSL-1", "RSL-2", "RSL-3")), na.rm = TRUE),
+    Nec_mean  = rowMeans(across(c("Nec-1", "Nec-2", "Nec-3")), na.rm = TRUE),
+    
+    DMSO_pass_blank = DMSO_mean > Blank * blank_fold,
+    STS_pass_blank  = STS_mean  > Blank * blank_fold,
+    Fas_pass_blank  = Fas_mean  > Blank * blank_fold,
+    RSL_pass_blank  = RSL_mean  > Blank * blank_fold,
+    Nec_pass_blank  = Nec_mean  > Blank * blank_fold,
+    
+    Any_condition_pass_blank = DMSO_pass_blank | STS_pass_blank | Fas_pass_blank | 
+                               RSL_pass_blank | Nec_pass_blank
+  )
+
+NEG_measure_clean <- NEG_measure_clean %>%
+  mutate(
+    DMSO_mean = rowMeans(across(c("DMSO-1", "DMSO-2", "DMSO-3")), na.rm = TRUE),
+    STS_mean  = rowMeans(across(c("STS-1", "STS-2", "STS-3")), na.rm = TRUE),
+    Fas_mean  = rowMeans(across(c("Fas-1", "Fas-2", "Fas-3")), na.rm = TRUE),
+    RSL_mean  = rowMeans(across(c("RSL-1", "RSL-2", "RSL-3")), na.rm = TRUE),
+    Nec_mean  = rowMeans(across(c("Nec-1", "Nec-2", "Nec-3")), na.rm = TRUE),
+    
+    DMSO_pass_blank = DMSO_mean > Blank * blank_fold,
+    STS_pass_blank  = STS_mean  > Blank * blank_fold,
+    Fas_pass_blank  = Fas_mean  > Blank * blank_fold,
+    RSL_pass_blank  = RSL_mean  > Blank * blank_fold,
+    Nec_pass_blank  = Nec_mean  > Blank * blank_fold,
+    
+    Any_condition_pass_blank = DMSO_pass_blank | STS_pass_blank | Fas_pass_blank | 
+                               RSL_pass_blank | Nec_pass_blank
+  )     #AnyCondition是指任一死亡模式高於5xBlank就保留＆計算
+
+#----5.1 count metabolites after condition-specific blank filter----
+#看一下Filtered後有多少被去除多少還在
+
+count_blank_filter <- function(df, mode_name) {
+  total_n <- nrow(df)
+  
+  tibble(
+    Mode = mode_name,
+    Blank_fold = blank_fold,
+    Condition = c("DMSO", "STS", "Fas", "RSL", "Nec", "Any_condition"),
+    Remaining_metabolites = c(
+      sum(df$DMSO_pass_blank, na.rm = TRUE),
+      sum(df$STS_pass_blank, na.rm = TRUE),
+      sum(df$Fas_pass_blank, na.rm = TRUE),
+      sum(df$RSL_pass_blank, na.rm = TRUE),
+      sum(df$Nec_pass_blank, na.rm = TRUE),
+      sum(df$Any_condition_pass_blank, na.rm = TRUE)
+    ),
+    Total_metabolites = total_n,
+    Removed_metabolites = Total_metabolites - Remaining_metabolites
+  )
+}
+
+blank_filter_summary <- bind_rows(
+  count_blank_filter(POS_measure_clean, "POS"),
+  count_blank_filter(NEG_measure_clean, "NEG")
+)
+
+blank_filter_summary
+```
+```{r}
+#----6. keep metabolites higher than 5x Blank in any condition----
+
+POS_measure_rm <- POS_measure_clean %>%
+  filter(Any_condition_pass_blank)
+
+NEG_measure_rm <- NEG_measure_clean %>%
+  filter(Any_condition_pass_blank)
+
+#----7. count metabolites before and after blank filter----
+
+blank_filter_summary <- tibble(
+  Mode = c("POS", "NEG"),
+  Blank_fold = blank_fold,
+  Before_filter = c(nrow(POS_measure_clean), nrow(NEG_measure_clean)),
+  After_filter = c(nrow(POS_measure_rm), nrow(NEG_measure_rm)),
+  Removed = Before_filter - After_filter
+)
+
+blank_filter_summary
+```
+```{r}
+
+#----8. count condition-specific retained metabolites----
+
+condition_blank_summary <- tibble(
+  Mode = rep(c("POS", "NEG"), each = 6),
+  Blank_fold = blank_fold,
+  Condition = rep(c("DMSO", "STS", "Fas", "RSL", "Nec", "Any_condition"), times = 2),
+  Remaining_metabolites = c(
+    sum(POS_measure_clean$DMSO_pass_blank, na.rm = TRUE),
+    sum(POS_measure_clean$STS_pass_blank, na.rm = TRUE),
+    sum(POS_measure_clean$Fas_pass_blank, na.rm = TRUE),
+    sum(POS_measure_clean$RSL_pass_blank, na.rm = TRUE),
+    sum(POS_measure_clean$Nec_pass_blank, na.rm = TRUE),
+    sum(POS_measure_clean$Any_condition_pass_blank, na.rm = TRUE),
+    
+    sum(NEG_measure_clean$DMSO_pass_blank, na.rm = TRUE),
+    sum(NEG_measure_clean$STS_pass_blank, na.rm = TRUE),
+    sum(NEG_measure_clean$Fas_pass_blank, na.rm = TRUE),
+    sum(NEG_measure_clean$RSL_pass_blank, na.rm = TRUE),
+    sum(NEG_measure_clean$Nec_pass_blank, na.rm = TRUE),
+    sum(NEG_measure_clean$Any_condition_pass_blank, na.rm = TRUE)
+  )
+)
+
+condition_blank_summary
+
+```
+```{r}
+#----9. export 5x Blank filtered measurement and identification----
+# Filter identification table based on 5x Blank filtered measurement
+#Export 5x Blank filtered measurement and identification
+#先建立會用到的命名：POS_iden_rm、NEG_iden_rm。
+
+POS_iden_rm <- POS_iden %>%
+  semi_join(POS_measure_rm %>% select(Compound), by = "Compound")
+
+NEG_iden_rm <- NEG_iden %>%
+  semi_join(NEG_measure_rm %>% select(Compound), by = "Compound")
+
+
+# Export measurement and identification after 5x Blank filter
+write_csv(
+  POS_measure_rm,
+  file.path(output_path, "1_Filtered(5xBlank)_POS_Measure.csv")
+)
+
+write_csv(
+  NEG_measure_rm,
+  file.path(output_path, "1_Filtered(5xBlank)_NEG_Measure.csv")
+)
+
+write_csv(
+  POS_iden_rm,
+  file.path(output_path, "1_Filtered(5xBlank)_POS_Identification.csv")
+)
+
+write_csv(
+  NEG_iden_rm,
+  file.path(output_path, "1_Filtered(5xBlank)_NEG_Identification.csv")
+)
+
+write_csv(
+  blank_filter_summary,
+  file.path(output_path, "1.1_Blank_Filter_Summary.csv")
+)
+
+write_csv(
+  condition_blank_summary,
+  file.path(output_path, "1.1_SpecificCondition_Filtered(5xBlank)_Summary.csv")
+)
+```
+
+
+```{r}
+# Quick summary
+iden_filter_summary <- tibble(
+  Mode = c("POS", "NEG"),
+  Measurement_filtered_metabolites = c(nrow(POS_measure_rm), nrow(NEG_measure_rm)),
+  Identification_filtered_rows = c(nrow(POS_iden_rm), nrow(NEG_iden_rm))
+)
+
+iden_filter_summary
+
+write_csv(
+  iden_filter_summary,
+  file.path(output_path, "1.2_Identification_Filter_Summary.csv")
+)
+```
+
+```{r}
+#----0. Install packages if needed----
+#為了存進ChemSpider要這樣Converted ID 需要的API金鑰
+
+install.packages("usethis")
+usethis::edit_r_environ()
+
+
+cran_pkgs <- c("tidyverse", "webchem")
+
+for (pkg in cran_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+```
+```{r}
+#----read selected response headers safely----
+#目前用不到我要來繞過API了
+headers_to_check <- c(
+  "retry-after",
+  "x-ratelimit-limit",
+  "x-ratelimit-remaining",
+  "x-ratelimit-reset"
+)
+
+header_check <- tibble(
+  Header = headers_to_check,
+  Value = sapply(headers_to_check, function(h) {
+    value <- httr2::resp_header(resp, h)
+    if (is.null(value)) NA_character_ else value
+  })
+)
+
+header_check
+
+resp_headers(resp)
+names(resp_headers(resp))
+tryCatch(
+  resp_body_string(resp),
+  error = function(e) conditionMessage(e)
+)
+```
+
+
+```{r}
+#----10. scrape external database IDs from ChemSpider compound page----
+# Purpose:
+# 1. Convert CSID into ChemSpider compound page URL
+# 2. Read ChemSpider webpage HTML
+# 3. Extract ChEBI, HMDB, and PubChem IDs from page text and links
+# 4. Always return clean columns:
+#    CSID, ChemSpider_URL, ChEBI_ID, HMDB_ID, PubChem_ID
+
+extract_external_ids_static <- function(csid) {
+  
+  url <- paste0(
+    "https://www.chemspider.com/Chemical-Structure.",
+    csid,
+    ".html"
+  )
+  
+  page_html <- tryCatch({
+    
+    req <- httr2::request(url) %>%
+      httr2::req_user_agent(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+      ) %>%
+      httr2::req_timeout(15) %>%
+      httr2::req_error(is_error = function(resp) FALSE)
+    
+    resp <- httr2::req_perform(req)
+    status <- httr2::resp_status(resp)
+    
+    if (status != 200) {
+      NA_character_
+    } else {
+      httr2::resp_body_string(resp)
+    }
+    
+  }, error = function(e) {
+    NA_character_
+  })
+  
+  if (is.na(page_html)) {
+    return(tibble(
+      CSID = as.character(csid),
+      ChemSpider_URL = url,
+      ChEBI_ID = NA_character_,
+      HMDB_ID = NA_character_,
+      PubChem_ID = NA_character_
+    ))
+  }
+  
+  page <- read_html(page_html)
+  
+  page_text <- page %>%
+    html_text2()
+  
+  links <- page %>%
+    html_elements("a")
+  
+  link_tbl <- tibble(
+    link_text = html_text2(links),
+    link_href = html_attr(links, "href")
+  ) %>%
+    mutate(
+      link_text = as.character(link_text),
+      link_href = as.character(link_href),
+      link_combined = paste(link_text, link_href)
+    )
+  
+  all_text <- paste(
+    page_text,
+    paste(link_tbl$link_combined, collapse = " "),
+    collapse = " "
+  )
+  
+  # ChEBI IDs: CHEBI:xxxxx or CHEBI_xxxxx
+  chebi_ids <- str_extract_all(
+    all_text,
+    regex("CHEBI[:_]?\\d+", ignore_case = TRUE)
+  )[[1]] %>%
+    str_to_upper() %>%
+    str_replace_all("CHEBI_", "CHEBI:") %>%
+    unique()
+  
+  # HMDB IDs: HMDB0051561, HMDB51561, HMDB0000001, etc.
+  hmdb_ids <- str_extract_all(
+    all_text,
+    regex("HMDB\\d{5,}", ignore_case = TRUE)
+  )[[1]] %>%
+    str_to_upper() %>%
+    unique()
+  
+  # PubChem IDs from PubChem URL
+  pubchem_from_url <- str_match_all(
+    paste(link_tbl$link_href, collapse = " "),
+    regex(
+      "pubchem\\.ncbi\\.nlm\\.nih\\.gov/(?:compound|substance|cid|sid)/([0-9]+)",
+      ignore_case = TRUE
+    )
+  )[[1]]
+  
+  pubchem_ids_from_url <- if (nrow(pubchem_from_url) > 0) {
+    pubchem_from_url[, 2]
+  } else {
+    character()
+  }
+  
+  # PubChem IDs from link text if href links to PubChem
+  pubchem_ids_from_link_text <- link_tbl %>%
+    filter(str_detect(link_href, regex("pubchem\\.ncbi\\.nlm\\.nih\\.gov", ignore_case = TRUE))) %>%
+    pull(link_text) %>%
+    str_extract_all("\\b\\d{2,}\\b") %>%
+    unlist()
+  
+  # PubChem IDs from visible text pattern: PubChem 131762284
+  pubchem_from_text <- str_match_all(
+    all_text,
+    regex("PubChem\\s+([0-9]{2,})", ignore_case = TRUE)
+  )[[1]]
+  
+  pubchem_ids_from_text <- if (nrow(pubchem_from_text) > 0) {
+    pubchem_from_text[, 2]
+  } else {
+    character()
+  }
+  
+   # PubChem IDs:
+  # 1. PubChem URLs
+  # 2. PubChem row visible text
+  # 3. Link text after PubChem data source
+  pubchem_from_url <- str_match_all(
+    all_text,
+    regex(
+      "pubchem\\.ncbi\\.nlm\\.nih\\.gov/(?:compound|substance|cid|sid)/([0-9]+)",
+      ignore_case = TRUE
+    )
+  )[[1]]
+  
+  pubchem_ids_from_url <- if (nrow(pubchem_from_url) > 0) {
+    pubchem_from_url[, 2]
+  } else {
+    character()
+  }
+  
+  pubchem_from_text <- str_match_all(
+    all_text,
+    regex("PubChem\\s+([0-9]{2,})", ignore_case = TRUE)
+  )[[1]]
+  
+  pubchem_ids_from_text <- if (nrow(pubchem_from_text) > 0) {
+    pubchem_from_text[, 2]
+  } else {
+    character()
+  }
+  
+  pubchem_ids_from_links <- link_tbl %>%
+    filter(
+      str_detect(link_text, regex("^\\d{2,}$")) |
+        str_detect(link_href, regex("pubchem|ncbi", ignore_case = TRUE))
+    ) %>%
+    mutate(combined = paste(link_text, link_href)) %>%
+    filter(str_detect(combined, regex("pubchem|ncbi|compound|substance|cid|sid", ignore_case = TRUE))) %>%
+    pull(combined) %>%
+    str_extract_all("\\b\\d{2,}\\b") %>%
+    unlist()
+  
+  pubchem_ids <- c(
+    pubchem_ids_from_url,
+    pubchem_ids_from_text,
+    pubchem_ids_from_links
+  ) %>%
+    unique()
+  
+  tibble(
+    CSID = as.character(csid),
+    ChemSpider_URL = url,
+    ChEBI_ID = ifelse(length(chebi_ids) == 0, NA_character_, paste(chebi_ids, collapse = ";")),
+    HMDB_ID = ifelse(length(hmdb_ids) == 0, NA_character_, paste(hmdb_ids, collapse = ";")),
+    PubChem_ID = ifelse(length(pubchem_ids) == 0, NA_character_, paste(pubchem_ids, collapse = ";"))
+  )
+}
+
+#----11. batch extract external database IDs from CSID list----
+# Purpose:
+# 1. Run extract_external_ids_static() for multiple CSIDs
+# 2. Save checkpoint every checkpoint_every records
+# 3. Overwrite the same output file during each checkpoint
+# 4. Force all ID columns to character to avoid bind_rows type conflict
+# 5. Default overwrite = TRUE means full rerun from beginning
+
+batch_extract_external_ids <- function(
+    csid_df,
+    mode_name,
+    sleep_min = 4,
+    sleep_max = 8,
+    checkpoint_every = 50,
+    overwrite = TRUE
+) {
+  
+  out_file <- file.path(
+    output_path,
+    paste0("2_ChemSpider_", mode_name, "_CSID_external_IDs.csv")
+  )
+  
+  if (overwrite && file.exists(out_file)) {
+    file.remove(out_file)
+  }
+  
+  csid_vec <- csid_df %>%
+    mutate(CSID = as.character(CSID)) %>%
+    pull(CSID) %>%
+    unique() %>%
+    as.character()
+  
+  result_list <- vector("list", length(csid_vec))
+  
+  for (i in seq_along(csid_vec)) {
+    
+    csid_i <- csid_vec[i]
+    
+    message(mode_name, ": ", i, " / ", length(csid_vec), " ; CSID = ", csid_i)
+    
+    result_list[[i]] <- extract_external_ids_static(csid_i) %>%
+      transmute(
+        CSID = as.character(CSID),
+        ChemSpider_URL = as.character(ChemSpider_URL),
+        ChEBI_ID = as.character(ChEBI_ID),
+        HMDB_ID = as.character(HMDB_ID),
+        PubChem_ID = as.character(PubChem_ID)
+      )
+    
+    if (i %% checkpoint_every == 0) {
+      
+      temp_result <- bind_rows(result_list[1:i]) %>%
+        transmute(
+          CSID = as.character(CSID),
+          ChemSpider_URL = as.character(ChemSpider_URL),
+          ChEBI_ID = as.character(ChEBI_ID),
+          HMDB_ID = as.character(HMDB_ID),
+          PubChem_ID = as.character(PubChem_ID)
+        ) %>%
+        distinct(CSID, .keep_all = TRUE)
+      
+      write_csv(temp_result, out_file)
+    }
+    
+    Sys.sleep(runif(1, min = sleep_min, max = sleep_max))
+  }
+  
+  final_result <- bind_rows(result_list) %>%
+    transmute(
+      CSID = as.character(CSID),
+      ChemSpider_URL = as.character(ChemSpider_URL),
+      ChEBI_ID = as.character(ChEBI_ID),
+      HMDB_ID = as.character(HMDB_ID),
+      PubChem_ID = as.character(PubChem_ID)
+    ) %>%
+    distinct(CSID, .keep_all = TRUE)
+  
+  write_csv(final_result, out_file)
+  
+  return(final_result)
+}
+```
+
+
+```{r}
+#試跑 NEG / POS #不然等等要跑大量失敗就ㄙㄨㄚˋ賽
+#----12. test external ID extraction with first 10 NEG CSIDs----
+
+NEG_external_ID_test <- batch_extract_external_ids(    #COST About 3Hr.35min
+  csid_df = NEG_CSID[1:10, ],
+  mode_name = "NEG_test",
+  sleep_min = 4,
+  sleep_max = 8,
+  checkpoint_every = 5,
+  overwrite = TRUE
+)
+
+NEG_external_ID_test %>%
+  print(n = Inf, width = Inf)
+
+NEG_external_ID_test %>%
+  summarise(
+    Total = n(),
+    With_ChEBI = sum(!is.na(ChEBI_ID)),
+    With_HMDB = sum(!is.na(HMDB_ID)),
+    With_PubChem = sum(!is.na(PubChem_ID)),
+    Any_external_ID = sum(!is.na(ChEBI_ID) | !is.na(HMDB_ID) | !is.na(PubChem_ID)),
+    Any_external_ID_rate = Any_external_ID / Total
+  ) %>%
+  print()
+
+#----13. test external ID extraction with first 10 POS CSIDs----
+
+POS_external_ID_test <- batch_extract_external_ids(     #COST About 16Hr30min
+  csid_df = POS_CSID[1:10, ],
+  mode_name = "POS_test",
+  sleep_min = 4,
+  sleep_max = 8,
+  checkpoint_every = 5,
+  overwrite = TRUE
+)
+
+POS_external_ID_test %>%
+  print(n = Inf, width = Inf)
+
+POS_external_ID_test %>%
+  summarise(
+    Total = n(),
+    With_ChEBI = sum(!is.na(ChEBI_ID)),
+    With_HMDB = sum(!is.na(HMDB_ID)),
+    With_PubChem = sum(!is.na(PubChem_ID)),
+    Any_external_ID = sum(!is.na(ChEBI_ID) | !is.na(HMDB_ID) | !is.na(PubChem_ID)),
+    Any_external_ID_rate = Any_external_ID / Total
+  ) %>%
+  print()
+```
+```{r}
+#----15. rerun full NEG CSID external ID extraction----
+
+system.time({
+  NEG_external_IDs <- batch_extract_external_ids(
+    csid_df = NEG_CSID,
+    mode_name = "NEG_iden",
+    sleep_min = 4,
+    sleep_max = 8,
+    checkpoint_every = 50,
+    overwrite = TRUE
+  )
+})
+
+#----16. rerun full POS CSID external ID extraction----
+
+system.time({
+  POS_external_IDs <- batch_extract_external_ids(
+    csid_df = POS_CSID,
+    mode_name = "POS_iden",
+    sleep_min = 4,
+    sleep_max = 8,
+    checkpoint_every = 50,
+    overwrite = TRUE
+  )
+})
+
+#----17. check external ID extraction result----
+
+check_external_id_summary <- function(df, mode_name) {
+  
+  df %>%
+    summarise(
+      Mode = mode_name,
+      Total = n(),
+      With_ChEBI = sum(!is.na(ChEBI_ID)),
+      With_HMDB = sum(!is.na(HMDB_ID)),
+      With_PubChem = sum(!is.na(PubChem_ID)),
+      Any_external_ID = sum(!is.na(ChEBI_ID) | !is.na(HMDB_ID) | !is.na(PubChem_ID)),
+      ChEBI_rate = With_ChEBI / Total,
+      HMDB_rate = With_HMDB / Total,
+      PubChem_rate = With_PubChem / Total,
+      Any_external_ID_rate = Any_external_ID / Total
+    )
+}
+
+bind_rows(
+  check_external_id_summary(NEG_external_IDs, "NEG"),
+  check_external_id_summary(POS_external_IDs, "POS")
+) %>%
+  print()
+```
+#Step 17,18. 整合 POS / NEG external IDs
+#Step 19,20. 把原本 identification 裡的 HMDB ID 也合進來
+#Step 3. 把 ChEBI / HMDB / PubChem 多 ID 展開成 long format
+#Step 4. 產生三種 conversion input：
+        ChEBI → KEGG
+        PubChem → KEGG
+        HMDB → KEGG
+#Step 5. 轉換後合併成 CSID_to_KEGG table
+#Step 6. 把 KEGG / HMDB / ChEBI / PubChem 對回 identification
+#Step 7. 再用 Compound 對回 measurement
+#Step 8. 做 fold change、condition-specific metabolite、pathway input
+
+
+
+```{r}
+#----17.1. save external ID extraction summary----
+
+external_ID_summary <- bind_rows(
+  check_external_id_summary(NEG_external_IDs, "NEG"),
+  check_external_id_summary(POS_external_IDs, "POS")
+)
+
+write_csv(
+  external_ID_summary,
+  file.path(output_path, "2.1_ChemSpider_external_IDs_Summary.csv")
+)
+
+external_ID_summary
+```
+```{r}
+#----18. import ChemSpider external ID results----
+# Purpose:
+# Read POS and NEG ChemSpider external ID files.
+# These files contain CSID, ChemSpider_URL, ChEBI_ID, HMDB_ID, and PubChem_ID.
+
+NEG_external_IDs <- read_csv(
+  file.path(output_path, "2_ChemSpider_NEG_iden_CSID_external_IDs.csv"),
+  show_col_types = FALSE,
+  col_types = cols(
+    CSID = col_character(),
+    ChemSpider_URL = col_character(),
+    ChEBI_ID = col_character(),
+    HMDB_ID = col_character(),
+    PubChem_ID = col_character()
+  )
+)
+
+POS_external_IDs <- read_csv(
+  file.path(output_path, "2_ChemSpider_POS_iden_CSID_external_IDs.csv"),
+  show_col_types = FALSE,
+  col_types = cols(
+    CSID = col_character(),
+    ChemSpider_URL = col_character(),
+    ChEBI_ID = col_character(),
+    HMDB_ID = col_character(),
+    PubChem_ID = col_character()
+  )
+)
+```
+
+```{r}
+#----19. merge external IDs back to filtered identification tables----
+# Purpose:
+# 1. Add ChemSpider-derived ChEBI/HMDB/PubChem IDs to CSID rows.
+# 2. Preserve original HMDB rows from QI identification table.
+# 3. Combine ChemSpider-derived HMDB and original QI-HMDB into Final_HMDB_ID.
+# 4. Build ID-rich identification tables for POS and NEG.
+#把 external IDs 合併回 identification table
+
+collapse_ids <- function(x) {
+  
+  x <- x %>%
+    na.omit() %>%
+    as.character() %>%
+    paste(collapse = ";") %>%
+    str_split(";") %>%
+    unlist() %>%
+    str_squish()
+  
+  x <- x[x != ""]
+  x <- unique(x)
+  
+  if (length(x) == 0) {
+    return(NA_character_)
+  } else {
+    return(paste(x, collapse = ";"))
+  }
+}
+
+merge_external_ids_to_iden <- function(iden_df, external_df, mode_name) {
+  
+  external_for_join <- external_df %>%
+    transmute(
+      `Compound ID` = paste0("CSID", as.character(CSID)),
+      CSID = as.character(CSID),
+      ChemSpider_URL = as.character(ChemSpider_URL),
+      ChEBI_ID = as.character(ChEBI_ID),
+      HMDB_ID = as.character(HMDB_ID),
+      PubChem_ID = as.character(PubChem_ID)
+    ) %>%
+    distinct(`Compound ID`, .keep_all = TRUE)
+  
+  iden_df %>%
+    mutate(
+      Mode = mode_name,
+      `Compound ID` = as.character(`Compound ID`),
+      
+      # Original HMDB IDs already present in QI identification table
+      Original_HMDB_ID = if_else(
+        str_detect(`Compound ID`, "^HMDB"),
+        `Compound ID`,
+        NA_character_
+      )
+    ) %>%
+    left_join(
+      external_for_join,
+      by = "Compound ID"
+    ) %>%
+    mutate(
+      Final_HMDB_ID = map2_chr(
+        HMDB_ID,
+        Original_HMDB_ID,
+        ~ collapse_ids(c(.x, .y))
+      ),
+      
+      Any_annotation_ID = !is.na(ChEBI_ID) |
+                          !is.na(Final_HMDB_ID) |
+                          !is.na(PubChem_ID)
+    )
+}
+
+NEG_iden_with_external_IDs <- merge_external_ids_to_iden(
+  iden_df = NEG_iden_rm,
+  external_df = NEG_external_IDs,
+  mode_name = "NEG"
+)
+
+POS_iden_with_external_IDs <- merge_external_ids_to_iden(
+  iden_df = POS_iden_rm,
+  external_df = POS_external_IDs,
+  mode_name = "POS"
+)
+
+write_csv(
+  NEG_iden_with_external_IDs,
+  file.path(output_path, "3_NEG_identification_with_external_IDs.csv")
+)
+
+write_csv(
+  POS_iden_with_external_IDs,
+  file.path(output_path, "3_POS_identification_with_external_IDs.csv")
+)
+```
+
+```{r}
+
+#----20. filter identification rows by mass error <= 15 ppm----
+# 1. identification table 裡面每一列是 QI software 給的一個 metabolite candidate。
+# 2. Mass Error (ppm) 代表實際量到的 m/z 和理論 m/z 差多少。
+# 3. 差越小，這個 annotation 越可信。
+# 4. 這裡只保留絕對值 <= 15 ppm 的 annotation rows。
+#    也就是：
+#    -15 ppm <= Mass Error <= +15 ppm
+#
+# 這一步得到的 Data 代表什麼？
+# NEG_iden_external_15ppm：
+#   NEG mode 中，通過 5x Blank filter，而且 Mass Error 在 ±15 ppm 內的 identification rows。
+# POS_iden_external_15ppm：
+#   POS mode 中，通過 5x Blank filter，而且 Mass Error 在 ±15 ppm 內的 identification rows。
+# mass_error_filter_summary：
+#   告訴你 15 ppm filter 前後各剩多少 identification rows。
+#
+# 注意：
+# 這一步還沒有刪掉沒有 ChEBI/HMDB/PubChem 的 rows。
+# 它只是先用 mass accuracy 把比較不可靠的 annotation 排除。
+
+mass_error_cutoff <- 15
+
+filter_iden_by_mass_error <- function(iden_df, mode_name) {
+  
+  iden_df %>%
+    mutate(
+      Mode = mode_name,
+      `Mass Error (ppm)` = as.numeric(`Mass Error (ppm)`),
+      Abs_Mass_Error_ppm = abs(`Mass Error (ppm)`),
+      Pass_15ppm = Abs_Mass_Error_ppm <= mass_error_cutoff
+    ) %>%
+    filter(Pass_15ppm)
+}
+
+NEG_iden_external_15ppm <- filter_iden_by_mass_error(
+  iden_df = NEG_iden_with_external_IDs,
+  mode_name = "NEG"
+)
+
+POS_iden_external_15ppm <- filter_iden_by_mass_error(
+  iden_df = POS_iden_with_external_IDs,
+  mode_name = "POS"
+)
+
+mass_error_filter_summary <- tibble(
+  Mode = c("NEG", "POS"),
+  Mass_error_cutoff_ppm = mass_error_cutoff,
+  Before_15ppm_filter = c(
+    nrow(NEG_iden_with_external_IDs),
+    nrow(POS_iden_with_external_IDs)
+  ),
+  After_15ppm_filter = c(
+    nrow(NEG_iden_external_15ppm),
+    nrow(POS_iden_external_15ppm)
+  )
+) %>%
+  mutate(
+    Removed_by_15ppm_filter = Before_15ppm_filter - After_15ppm_filter,
+    Remaining_rate = After_15ppm_filter / Before_15ppm_filter
+  )
+
+write_csv(
+  NEG_iden_external_15ppm,
+  file.path(output_path, "4_NEG_identification_with_external_IDs_15ppm.csv")
+)
+
+write_csv(
+  POS_iden_external_15ppm,
+  file.path(output_path, "4_POS_identification_with_external_IDs_15ppm.csv")
+)
+
+write_csv(
+  mass_error_filter_summary,
+  file.path(output_path, "4_Mass_Error_15ppm_Filter_Summary.csv")
+)
+
+mass_error_filter_summary
+```
+
+```{r}
+#----20-1. export stricter identification rows by mass error <= 10 ppm----
+# 這一步在做什麼？
+# 1. 這是 15 ppm 正式分析之外的嚴格版本。
+# 2. 只保留 Mass Error 在 ±10 ppm 內的 identification rows。
+# 3. 這份資料可以當 sensitivity analysis：
+#    如果 15 ppm 和 10 ppm 得到的 biological conclusion 很接近，代表結果比較穩。
+#
+# 這一步得到的 Data 代表什麼？
+# NEG_iden_external_10ppm：
+#   NEG mode 中，通過 5x Blank filter，而且 Mass Error 在 ±10 ppm 內的 identification rows。
+# POS_iden_external_10ppm：
+#   POS mode 中，通過 5x Blank filter，而且 Mass Error 在 ±10 ppm 內的 identification rows。
+# mass_error_filter_summary_10ppm：
+#   告訴你 10 ppm filter 前後各剩多少 identification rows。
+#
+# 注意：
+# 這份是 stricter version，不建議直接取代 15 ppm 主分析。
+# 後續如果要做 10 ppm 版本的 KEGG / HMDB analysis，可以另開一套 _10ppm pipeline。
+
+mass_error_cutoff_10ppm <- 10
+
+filter_iden_by_mass_error_10ppm <- function(iden_df, mode_name) {
+  
+  iden_df %>%
+    mutate(
+      Mode = mode_name,
+      `Mass Error (ppm)` = as.numeric(`Mass Error (ppm)`),
+      Abs_Mass_Error_ppm = abs(`Mass Error (ppm)`),
+      Pass_10ppm = Abs_Mass_Error_ppm <= mass_error_cutoff_10ppm
+    ) %>%
+    filter(Pass_10ppm)
+}
+
+NEG_iden_external_10ppm <- filter_iden_by_mass_error_10ppm(
+  iden_df = NEG_iden_with_external_IDs,
+  mode_name = "NEG"
+)
+
+POS_iden_external_10ppm <- filter_iden_by_mass_error_10ppm(
+  iden_df = POS_iden_with_external_IDs,
+  mode_name = "POS"
+)
+
+mass_error_filter_summary_10ppm <- tibble(
+  Mode = c("NEG", "POS"),
+  Mass_error_cutoff_ppm = mass_error_cutoff_10ppm,
+  Before_10ppm_filter = c(
+    nrow(NEG_iden_with_external_IDs),
+    nrow(POS_iden_with_external_IDs)
+  ),
+  After_10ppm_filter = c(
+    nrow(NEG_iden_external_10ppm),
+    nrow(POS_iden_external_10ppm)
+  )
+) %>%
+  mutate(
+    Removed_by_10ppm_filter = Before_10ppm_filter - After_10ppm_filter,
+    Remaining_rate = After_10ppm_filter / Before_10ppm_filter
+  )
+
+write_csv(
+  NEG_iden_external_10ppm,
+  file.path(output_path, "4_NEG_identification_with_external_IDs_10ppm.csv")
+)
+
+write_csv(
+  POS_iden_external_10ppm,
+  file.path(output_path, "4_POS_identification_with_external_IDs_10ppm.csv")
+)
+
+write_csv(
+  mass_error_filter_summary_10ppm,
+  file.path(output_path, "4_Mass_Error_10ppm_Filter_Summary.csv")
+)
+
+mass_error_filter_summary_10ppm
+```
+```{r}
+#----20-2. compare 15 ppm and 10 ppm mass error filters----
+# 這一步在做什麼？
+# 1. 把 15 ppm 和 10 ppm 的保留數量放在一起比較。
+# 2. 幫你判斷 10 ppm 是否砍掉太多資料。
+#
+# 這一步得到的 Data 代表什麼？
+# mass_error_filter_comparison：
+#   POS / NEG 在 15 ppm 和 10 ppm 下各保留多少 rows。
+
+mass_error_filter_comparison <- tibble(
+  Mode = c("NEG", "POS"),
+  Before_filter = c(
+    nrow(NEG_iden_with_external_IDs),
+    nrow(POS_iden_with_external_IDs)
+  ),
+  After_15ppm_filter = c(
+    nrow(NEG_iden_external_15ppm),
+    nrow(POS_iden_external_15ppm)
+  ),
+  After_10ppm_filter = c(
+    nrow(NEG_iden_external_10ppm),
+    nrow(POS_iden_external_10ppm)
+  )
+) %>%
+  mutate(
+    Retention_rate_15ppm = After_15ppm_filter / Before_filter,
+    Retention_rate_10ppm = After_10ppm_filter / Before_filter,
+    Extra_removed_by_10ppm_vs_15ppm = After_15ppm_filter - After_10ppm_filter
+  )
+
+write_csv(
+  mass_error_filter_comparison,
+  file.path(output_path, "4_Mass_Error_15ppm_vs_10ppm_Comparison.csv")
+)
+
+mass_error_filter_comparison
+```
+```{r}
+#----21. keep only annotated identification rows after 15 ppm filter----
+# 這一步在做什麼？
+# 1. #20 已經保留 Mass Error 在 ±15 ppm 內的 identification rows。
+# 2. 但有些 rows 雖然 mass error 合格，卻沒有 ChEBI / HMDB / PubChem。
+# 3. 這些 rows 目前無法知道對應到什麼 metabolite，也不適合進入 KEGG / HMDB / metabolite annotation analysis。
+# 4. 所以這一步只保留至少有一種 annotation ID 的 rows：
+#    ChEBI_ID、Final_HMDB_ID、PubChem_ID 其中之一不為 NA。
+#
+# 這一步得到的 Data 代表什麼？
+# NEG_iden_external_15ppm_annotated：
+#   NEG mode 中，通過 15 ppm，而且至少有 ChEBI / HMDB / PubChem 任一 ID 的 identification rows。
+# POS_iden_external_15ppm_annotated：
+#   POS mode 中，通過 15 ppm，而且至少有 ChEBI / HMDB / PubChem 任一 ID 的 identification rows。
+# annotation_filter_summary_15ppm：
+#   告訴你 15 ppm 後，有多少 rows 因為完全沒有 annotation ID 被排除。
+
+NEG_iden_external_15ppm_annotated <- NEG_iden_external_15ppm %>%
+  filter(!is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID))
+
+POS_iden_external_15ppm_annotated <- POS_iden_external_15ppm %>%
+  filter(!is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID))
+
+annotation_filter_summary_15ppm <- tibble(
+  Mode = c("NEG", "POS"),
+  Rows_after_15ppm_filter = c(
+    nrow(NEG_iden_external_15ppm),
+    nrow(POS_iden_external_15ppm)
+  ),
+  Rows_with_annotation_ID = c(
+    nrow(NEG_iden_external_15ppm_annotated),
+    nrow(POS_iden_external_15ppm_annotated)
+  )
+) %>%
+  mutate(
+    Rows_without_annotation_ID = Rows_after_15ppm_filter - Rows_with_annotation_ID,
+    Annotation_ID_rate = Rows_with_annotation_ID / Rows_after_15ppm_filter
+  )
+
+write_csv(
+  NEG_iden_external_15ppm_annotated,
+  file.path(output_path, "5_NEG_identification_with_external_IDs_15ppm_annotated_only.csv")
+)
+
+write_csv(
+  POS_iden_external_15ppm_annotated,
+  file.path(output_path, "5_POS_identification_with_external_IDs_15ppm_annotated_only.csv")
+)
+
+write_csv(
+  annotation_filter_summary_15ppm,
+  file.path(output_path, "5_Annotation_ID_Filter_Summary_15ppm.csv")
+)
+
+annotation_filter_summary_15ppm
+```
+
+```{r}
+#----22. check annotation ID coverage after 15 ppm and annotated-only filter----
+# 這一步在做什麼？
+# 1. 檢查 annotated-only table 裡面有多少 rows 帶有 ChEBI / HMDB / PubChem。
+# 2. 這可以幫你了解後面轉 KEGG 或做 HMDB annotation 時，主要會依賴哪一種 ID。
+#
+# 這一步得到的 Data 代表什麼？
+# iden_external_summary_15ppm：
+#   在 Mass Error ±15 ppm 且有 annotation ID 的 rows 中，
+#   POS / NEG 各有多少 ChEBI / HMDB / PubChem。
+#
+# 注意：
+# Rows_with_any_annotation_ID 理論上應該等於全部 rows，
+# 因為 #21 已經刪掉三種 ID 都是 NA 的 rows。
+
+iden_external_summary_15ppm <- bind_rows(
+  NEG_iden_external_15ppm_annotated,
+  POS_iden_external_15ppm_annotated
+) %>%
+  group_by(Mode) %>%
+  summarise(
+    Identification_rows_15ppm_annotated = n(),
+    Rows_with_ChEBI = sum(!is.na(ChEBI_ID)),
+    Rows_with_HMDB = sum(!is.na(Final_HMDB_ID)),
+    Rows_with_PubChem = sum(!is.na(PubChem_ID)),
+    Rows_with_any_annotation_ID = sum(
+      !is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID)
+    ),
+    ChEBI_row_rate = Rows_with_ChEBI / Identification_rows_15ppm_annotated,
+    HMDB_row_rate = Rows_with_HMDB / Identification_rows_15ppm_annotated,
+    PubChem_row_rate = Rows_with_PubChem / Identification_rows_15ppm_annotated,
+    Any_annotation_ID_row_rate = Rows_with_any_annotation_ID / Identification_rows_15ppm_annotated,
+    .groups = "drop"
+  )
+
+write_csv(
+  iden_external_summary_15ppm,
+  file.path(output_path, "6_Identification_external_ID_Coverage_Summary_15ppm_annotated_only.csv")
+)
+
+iden_external_summary_15ppm
+```
+
+```{r}
+#----23. expand ChEBI / HMDB / PubChem IDs into long format----
+# 這一步在做什麼？
+# 1. 有些 metabolite candidate 會同時有多個 ChEBI / HMDB / PubChem ID。
+#    例如：
+#    CHEBI:143163;CHEBI:73514
+#    HMDB0051561;HMDB51561
+# 2. 這一步把一格裡面的多個 ID 拆開。
+# 3. 拆開後，一個 External_ID 會變成一列。
+# 4. 這樣後面才能把每個 ID 分別拿去轉 KEGG。
+#
+# 這一步得到的 Data 代表什麼？
+# external_ID_long_15ppm：
+#   一張長格式 ID 對照表。
+#   每一列代表：
+#   某個 Mode / Compound / Compound ID / CSID 對到的一個 external ID。
+#
+# 為什麼要做 long format？
+# 因為 KEGG conversion 不能直接吃 "CHEBI:1;CHEBI:2" 這種合併字串。
+# 必須拆成一個 ID 一列。
+
+normalize_hmdb_id <- function(x) {
+  
+  hmdb_num <- str_extract(x, "\\d+")
+  
+  ifelse(
+    is.na(hmdb_num),
+    NA_character_,
+    paste0("HMDB", str_pad(hmdb_num, width = 7, side = "left", pad = "0"))
+  )
+}
+
+external_ID_long_15ppm <- bind_rows(
+  NEG_iden_external_15ppm_annotated,
+  POS_iden_external_15ppm_annotated
+) %>%
+  select(
+    Mode,
+    Compound,
+    `Compound ID`,
+    CSID,
+    ChEBI_ID,
+    Final_HMDB_ID,
+    PubChem_ID,
+    Score,
+    `Fragmentation Score`,
+    `Mass Error (ppm)`,
+    Abs_Mass_Error_ppm,
+    `Isotope Similarity`
+  ) %>%
+  rename(
+    HMDB_ID = Final_HMDB_ID
+  ) %>%
+  pivot_longer(
+    cols = c(ChEBI_ID, HMDB_ID, PubChem_ID),
+    names_to = "ID_type",
+    values_to = "External_ID"
+  ) %>%
+  separate_rows(External_ID, sep = ";") %>%
+  mutate(
+    External_ID = str_squish(External_ID),
+    External_ID = na_if(External_ID, ""),
+    
+    External_ID = case_when(
+      ID_type == "HMDB_ID" ~ normalize_hmdb_id(External_ID),
+      ID_type == "ChEBI_ID" ~ str_to_upper(External_ID),
+      ID_type == "PubChem_ID" ~ External_ID,
+      TRUE ~ External_ID
+    ),
+    
+    # ChEBI 和 PubChem 之後會用 KEGG REST 嘗試轉成 KEGG compound ID。
+    # HMDB 先保留，後面可用 MetaboAnalyst 或 HMDB mapping table 轉 KEGG。
+    KEGG_query = case_when(
+      ID_type == "ChEBI_ID" ~ str_replace(External_ID, "^CHEBI:", "chebi:"),
+      ID_type == "PubChem_ID" ~ paste0("pubchem:", External_ID),
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(External_ID)) %>%
+  distinct(
+    Mode,
+    Compound,
+    `Compound ID`,
+    CSID,
+    ID_type,
+    External_ID,
+    KEGG_query,
+    .keep_all = TRUE
+  )
+
+write_csv(
+  external_ID_long_15ppm,
+  file.path(output_path, "7_External_ID_long_before_KEGG_conversion_15ppm.csv")
+)
+
+external_ID_long_summary_15ppm <- external_ID_long_15ppm %>%
+  group_by(Mode, ID_type) %>%
+  summarise(
+    Unique_external_IDs = n_distinct(External_ID),
+    Rows = n(),
+    .groups = "drop"
+  )
+
+write_csv(
+  external_ID_long_summary_15ppm,
+  file.path(output_path, "7_External_ID_long_Summary_15ppm.csv")
+)
+
+external_ID_long_summary_15ppm
+```
+
+```{r}
+#----24. create ID query lists for KEGG conversion----
+# 這一步在做什麼？
+# 1. 從 external_ID_long_15ppm 裡面整理出三種 ID list：
+#    - ChEBI list
+#    - PubChem list
+#    - HMDB list
+# 2. ChEBI 和 PubChem 之後會直接用 R 跑 KEGG conversion。
+# 3. HMDB 之後會用 MetaboAnalyst 或其他 mapping table 轉成 KEGG。
+#
+# 這一步得到的 Data 代表什麼？
+# chebi_query_list_15ppm：
+#   準備拿去做 ChEBI -> KEGG 的 ChEBI IDs。
+# pubchem_query_list_15ppm：
+#   準備拿去做 PubChem -> KEGG 的 PubChem IDs。
+# hmdb_ID_list_15ppm：
+#   準備拿去做 HMDB -> KEGG 或 HMDB-based annotation 的 HMDB IDs。
+# ID_query_summary_15ppm：
+#   三種 ID 各有多少 unique IDs。
+
+chebi_query_list_15ppm <- external_ID_long_15ppm %>%
+  filter(ID_type == "ChEBI_ID") %>%
+  select(External_ID, KEGG_query) %>%
+  distinct() %>%
+  arrange(External_ID)
+
+pubchem_query_list_15ppm <- external_ID_long_15ppm %>%
+  filter(ID_type == "PubChem_ID") %>%
+  select(External_ID, KEGG_query) %>%
+  distinct() %>%
+  arrange(External_ID)
+
+hmdb_ID_list_15ppm <- external_ID_long_15ppm %>%
+  filter(ID_type == "HMDB_ID") %>%
+  select(External_ID) %>%
+  distinct() %>%
+  arrange(External_ID)
+
+write_csv(
+  chebi_query_list_15ppm,
+  file.path(output_path, "8_ChEBI_query_list_for_KEGG_15ppm.csv")
+)
+
+write_csv(
+  pubchem_query_list_15ppm,
+  file.path(output_path, "8_PubChem_query_list_for_KEGG_15ppm.csv")
+)
+
+write_csv(
+  hmdb_ID_list_15ppm,
+  file.path(output_path, "8_HMDB_ID_list_for_KEGG_conversion_15ppm.csv")
+)
+
+ID_query_summary_15ppm <- tibble(
+  ID_type = c("ChEBI", "PubChem", "HMDB"),
+  Unique_ID_count = c(
+    nrow(chebi_query_list_15ppm),
+    nrow(pubchem_query_list_15ppm),
+    nrow(hmdb_ID_list_15ppm)
+  )
+)
+
+write_csv(
+  ID_query_summary_15ppm,
+  file.path(output_path, "8_ID_query_list_summary_15ppm.csv")
+)
+
+ID_query_summary_15ppm
+```
+```{r}
+#----25. check multiple external IDs per CSID----
+# 這一步在做什麼？
+# 1. 檢查同一個 CSID 是否對到多個 ChEBI / HMDB / PubChem IDs。
+# 2. 多個 ID 不一定是錯，可能是資料庫同義詞、舊 ID、新 ID、salt form、isomer 等。
+# 3. 這一步只是標記出來，後面轉 KEGG 時不要硬刪。
+#
+# 這一步得到的 Data 代表什麼？
+# multiple_ID_summary_15ppm：
+#   哪些 CSID 有多個 external IDs。
+#
+# 後續用途：
+# 如果某個 CSID 最後轉出多個 KEGG IDs，就要標記為 ambiguous mapping。
+
+multiple_ID_summary_15ppm <- external_ID_long_15ppm %>%
+  group_by(Mode, CSID, ID_type) %>%
+  summarise(
+    n_external_ID = n_distinct(External_ID),
+    External_IDs = paste(unique(External_ID), collapse = ";"),
+    .groups = "drop"
+  ) %>%
+  filter(n_external_ID > 1) %>%
+  arrange(desc(n_external_ID), Mode, ID_type)
+
+write_csv(
+  multiple_ID_summary_15ppm,
+  file.path(output_path, "9_Multiple_external_IDs_per_CSID_summary_15ppm.csv")
+)
+
+multiple_ID_summary_15ppm %>%
+  head(30)
+```
+
+```{r}
+#----26. merge annotated-only 15ppm IDs back to measurement tables----
+# 這一步在做什麼？
+# 1. Measurement table 是定量資料，包含 DMSO / STS / Fas / RSL / Nec / Blank 等 intensity。
+# 2. Identification table 是 annotation 資料，包含 Compound ID、ChEBI、HMDB、PubChem。
+# 3. 這一步把 annotation 對回 measurement。
+#
+# 為什麼用 Compound 對回？
+# POS_measure_rm / NEG_measure_rm 和 identification table 都有 Compound 欄位。
+#
+# 為什麼要先 collapse？
+# 因為同一個 Compound 可能有多個 identification candidates。
+# 如果直接 left_join，measurement rows 可能會被放大成很多列。
+# 所以先把同一個 Compound 的 annotation 合併成一列，再 join 回 measurement。
+#
+# 這一步得到的 Data 代表什麼？
+# NEG_measure_with_external_IDs_15ppm：
+#   NEG mode 中，有定量訊號，且對回 15ppm annotated-only annotation 的 measurement features。
+# POS_measure_with_external_IDs_15ppm：
+#   POS mode 中，有定量訊號，且對回 15ppm annotated-only annotation 的 measurement features。
+#
+# 注意：
+# 這兩張表是後面做 fold change、heatmap、condition-specific metabolite analysis 的基礎表。
+
+collapse_unique_ids <- function(x) {
+  
+  x <- x %>%
+    na.omit() %>%
+    as.character() %>%
+    paste(collapse = ";") %>%
+    str_split(";") %>%
+    unlist() %>%
+    str_squish()
+  
+  x <- x[x != ""]
+  x <- unique(x)
+  
+  if (length(x) == 0) {
+    NA_character_
+  } else {
+    paste(x, collapse = ";")
+  }
+}
+
+make_compound_annotation_table <- function(iden_15ppm_annotated_df) {
+  
+  iden_15ppm_annotated_df %>%
+    group_by(Compound) %>%
+    summarise(
+      `Compound ID` = collapse_unique_ids(`Compound ID`),
+      CSID = collapse_unique_ids(CSID),
+      ChEBI_ID = collapse_unique_ids(ChEBI_ID),
+      Final_HMDB_ID = collapse_unique_ids(Final_HMDB_ID),
+      PubChem_ID = collapse_unique_ids(PubChem_ID),
+      Best_abs_mass_error_ppm = min(Abs_Mass_Error_ppm, na.rm = TRUE),
+      Best_score = max(Score, na.rm = TRUE),
+      Best_fragmentation_score = max(`Fragmentation Score`, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+NEG_compound_annotation_15ppm <- make_compound_annotation_table(
+  NEG_iden_external_15ppm_annotated
+)
+
+POS_compound_annotation_15ppm <- make_compound_annotation_table(
+  POS_iden_external_15ppm_annotated
+)
+
+NEG_measure_with_external_IDs_15ppm <- NEG_measure_rm %>%
+  left_join(
+    NEG_compound_annotation_15ppm,
+    by = "Compound"
+  ) %>%
+  filter(!is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID))
+
+POS_measure_with_external_IDs_15ppm <- POS_measure_rm %>%
+  left_join(
+    POS_compound_annotation_15ppm,
+    by = "Compound"
+  ) %>%
+  filter(!is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID))
+
+write_csv(
+  NEG_measure_with_external_IDs_15ppm,
+  file.path(output_path, "10_NEG_measurement_with_external_IDs_15ppm_annotated_only.csv")
+)
+
+write_csv(
+  POS_measure_with_external_IDs_15ppm,
+  file.path(output_path, "10_POS_measurement_with_external_IDs_15ppm_annotated_only.csv")
+)
+```
+```{r}
+#----27. check measurement annotation coverage after 15 ppm filter----
+# 這一步在做什麼？
+# 1. 檢查 measurement features 對回 annotated-only annotation 後，剩下多少 rows。
+# 2. 這是 feature-level 的 summary，不是 identification row-level。
+#
+# 這一步得到的 Data 代表什麼？
+# measurement_annotation_summary_15ppm：
+#   代表通過 5x Blank filter 的 measurement features 中，
+#   有多少可以對到 15ppm 且有 annotation ID 的 metabolite。
+#
+# 後續用途：
+# 這可以告訴你最後真正能拿來做定量分析的 annotated metabolite 數量。
+
+measurement_annotation_summary_15ppm <- bind_rows(
+  NEG_measure_with_external_IDs_15ppm %>% mutate(Mode = "NEG"),
+  POS_measure_with_external_IDs_15ppm %>% mutate(Mode = "POS")
+) %>%
+  group_by(Mode) %>%
+  summarise(
+    Measurement_features_annotated_15ppm = n(),
+    Features_with_ChEBI = sum(!is.na(ChEBI_ID)),
+    Features_with_HMDB = sum(!is.na(Final_HMDB_ID)),
+    Features_with_PubChem = sum(!is.na(PubChem_ID)),
+    Features_with_any_annotation_ID = sum(
+      !is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID)
+    ),
+    ChEBI_feature_rate = Features_with_ChEBI / Measurement_features_annotated_15ppm,
+    HMDB_feature_rate = Features_with_HMDB / Measurement_features_annotated_15ppm,
+    PubChem_feature_rate = Features_with_PubChem / Measurement_features_annotated_15ppm,
+    Any_annotation_ID_feature_rate = Features_with_any_annotation_ID / Measurement_features_annotated_15ppm,
+    .groups = "drop"
+  )
+
+write_csv(
+  measurement_annotation_summary_15ppm,
+  file.path(output_path, "10_Measurement_annotation_Coverage_Summary_15ppm.csv")
+)
+
+measurement_annotation_summary_15ppm
+```
+
+```{r}
+#----25-1. check annotation ambiguity per Compound----
+# 這一步在做什麼？
+# 1. 檢查每個 measurement feature / Compound 對到多少個候選 Compound ID、CSID、ChEBI、HMDB、PubChem。
+# 2. 如果一個 Compound 對到太多 IDs，代表 annotation ambiguity 高。
+# 3. 後面做 biological interpretation 時，這些 features 要比較保守。
+#
+# 這一步得到的 Data 代表什麼？
+# compound_annotation_ambiguity_15ppm：
+#   每個 Compound 有多少候選 annotation IDs。
+# ambiguity_summary_15ppm：
+#   POS / NEG 整體 annotation ambiguity 的摘要。
+
+count_semicolon_ids <- function(x) {
+  
+  ifelse(
+    is.na(x) | x == "",
+    0,
+    str_count(x, ";") + 1
+  )
+}
+
+compound_annotation_ambiguity_15ppm <- bind_rows(
+  NEG_compound_annotation_15ppm %>% mutate(Mode = "NEG"),
+  POS_compound_annotation_15ppm %>% mutate(Mode = "POS")
+) %>%
+  mutate(
+    n_Compound_ID = count_semicolon_ids(`Compound ID`),
+    n_CSID = count_semicolon_ids(CSID),
+    n_ChEBI_ID = count_semicolon_ids(ChEBI_ID),
+    n_HMDB_ID = count_semicolon_ids(Final_HMDB_ID),
+    n_PubChem_ID = count_semicolon_ids(PubChem_ID),
+    High_annotation_ambiguity = n_CSID >= 5 | n_ChEBI_ID >= 3 | n_HMDB_ID >= 3 | n_PubChem_ID >= 3
+  )
+
+ambiguity_summary_15ppm <- compound_annotation_ambiguity_15ppm %>%
+  group_by(Mode) %>%
+  summarise(
+    Features = n(),
+    Median_CSID_per_feature = median(n_CSID, na.rm = TRUE),
+    Mean_CSID_per_feature = mean(n_CSID, na.rm = TRUE),
+    Features_with_multiple_CSID = sum(n_CSID > 1, na.rm = TRUE),
+    Features_with_high_ambiguity = sum(High_annotation_ambiguity, na.rm = TRUE),
+    High_ambiguity_rate = Features_with_high_ambiguity / Features,
+    .groups = "drop"
+  )
+
+write_csv(
+  compound_annotation_ambiguity_15ppm,
+  file.path(output_path, "11_Compound_annotation_ambiguity_15ppm.csv")
+)
+
+write_csv(
+  ambiguity_summary_15ppm,
+  file.path(output_path, "11_Annotation_ambiguity_Summary_15ppm.csv")
+)
+
+ambiguity_summary_15ppm
+```
+```{r}
+#----20. filter identification rows by mass error <= 15 ppm----
+# 這一步在做什麼？
+# 1. identification table 裡每一列是 QI software 給的一個 metabolite candidate。
+# 2. Mass Error (ppm) 代表實際 m/z 和理論 m/z 的誤差。
+# 3. 這裡只保留 -15 ppm 到 +15 ppm 之間的 candidates。
+#
+# 這一步得到的 Data 代表什麼？
+# NEG_iden_external_15ppm：
+#   NEG mode 中，通過 5x Blank filter，而且 Mass Error 在 ±15 ppm 內的 identification candidates。
+# POS_iden_external_15ppm：
+#   POS mode 中，通過 5x Blank filter，而且 Mass Error 在 ±15 ppm 內的 identification candidates。
+# mass_error_filter_summary_15ppm：
+#   告訴你 15 ppm filter 前後各剩多少 identification rows。
+
+mass_error_cutoff <- 15
+
+filter_iden_by_mass_error <- function(iden_df, mode_name) {
+  
+  iden_df %>%
+    mutate(
+      Mode = mode_name,
+      `Mass Error (ppm)` = as.numeric(`Mass Error (ppm)`),
+      Score = as.numeric(Score),
+      `Fragmentation Score` = as.numeric(`Fragmentation Score`),
+      `Isotope Similarity` = as.numeric(`Isotope Similarity`),
+      Abs_Mass_Error_ppm = abs(`Mass Error (ppm)`),
+      Pass_15ppm = Abs_Mass_Error_ppm <= mass_error_cutoff
+    ) %>%
+    filter(Pass_15ppm)
+}
+
+NEG_iden_external_15ppm <- filter_iden_by_mass_error(
+  iden_df = NEG_iden_with_external_IDs,
+  mode_name = "NEG"
+)
+
+POS_iden_external_15ppm <- filter_iden_by_mass_error(
+  iden_df = POS_iden_with_external_IDs,
+  mode_name = "POS"
+)
+
+mass_error_filter_summary_15ppm <- tibble(
+  Mode = c("NEG", "POS"),
+  Mass_error_cutoff_ppm = mass_error_cutoff,
+  Before_15ppm_filter = c(
+    nrow(NEG_iden_with_external_IDs),
+    nrow(POS_iden_with_external_IDs)
+  ),
+  After_15ppm_filter = c(
+    nrow(NEG_iden_external_15ppm),
+    nrow(POS_iden_external_15ppm)
+  )
+) %>%
+  mutate(
+    Removed_by_15ppm_filter = Before_15ppm_filter - After_15ppm_filter,
+    Remaining_rate = After_15ppm_filter / Before_15ppm_filter
+  )
+
+write_csv(
+  NEG_iden_external_15ppm,
+  file.path(output_path, "4_NEG_identification_with_external_IDs_15ppm.csv")
+)
+
+write_csv(
+  POS_iden_external_15ppm,
+  file.path(output_path, "4_POS_identification_with_external_IDs_15ppm.csv")
+)
+
+write_csv(
+  mass_error_filter_summary_15ppm,
+  file.path(output_path, "4_Mass_Error_15ppm_Filter_Summary.csv")
+)
+
+mass_error_filter_summary_15ppm
+```
+```{r}
+#----21. keep only annotated identification rows after 15 ppm filter----
+# 這一步在做什麼？
+# 1. 只保留至少有 ChEBI / HMDB / PubChem 其中一種 ID 的 candidates。
+# 2. 完全沒有 external ID 的 row 先排除，因為目前無法做 metabolite annotation 或 KEGG mapping。
+#
+# 這一步得到的 Data 代表什麼？
+# NEG_iden_external_15ppm_annotated：
+#   NEG mode 中，15 ppm 內且有 annotation ID 的 candidates。
+# POS_iden_external_15ppm_annotated：
+#   POS mode 中，15 ppm 內且有 annotation ID 的 candidates。
+# annotation_filter_summary_15ppm：
+#   告訴你有多少 row 因為完全沒有 annotation ID 被排除。
+
+NEG_iden_external_15ppm_annotated <- NEG_iden_external_15ppm %>%
+  filter(!is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID))
+
+POS_iden_external_15ppm_annotated <- POS_iden_external_15ppm %>%
+  filter(!is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID))
+
+annotation_filter_summary_15ppm <- tibble(
+  Mode = c("NEG", "POS"),
+  Rows_after_15ppm_filter = c(
+    nrow(NEG_iden_external_15ppm),
+    nrow(POS_iden_external_15ppm)
+  ),
+  Rows_with_annotation_ID = c(
+    nrow(NEG_iden_external_15ppm_annotated),
+    nrow(POS_iden_external_15ppm_annotated)
+  )
+) %>%
+  mutate(
+    Rows_without_annotation_ID = Rows_after_15ppm_filter - Rows_with_annotation_ID,
+    Annotation_ID_rate = Rows_with_annotation_ID / Rows_after_15ppm_filter
+  )
+
+write_csv(
+  NEG_iden_external_15ppm_annotated,
+  file.path(output_path, "5_NEG_identification_with_external_IDs_15ppm_annotated_only.csv")
+)
+
+write_csv(
+  POS_iden_external_15ppm_annotated,
+  file.path(output_path, "5_POS_identification_with_external_IDs_15ppm_annotated_only.csv")
+)
+
+write_csv(
+  annotation_filter_summary_15ppm,
+  file.path(output_path, "5_Annotation_ID_Filter_Summary_15ppm.csv")
+)
+
+annotation_filter_summary_15ppm
+```
+```{r}
+#----22. limit annotation candidates to top 10 per Compound----
+# 這一步在做什麼？
+# 1. 有些 Compound / feature 會對到很多 CSID 或 HMDB candidates。
+# 2. 你不想讓一個 feature 帶著幾十個候選 ID 進入後續分析。
+# 3. 這一步每個 Mode + Compound 最多保留 10 個 candidate rows。
+# 4. 保留規則不是隨機，而是依據：
+#    Mass error 小、Fragmentation Score 高、Score 高、Isotope Similarity 高、有 external ID。
+#
+# 這一步得到的 Data 代表什麼？
+# NEG_iden_external_15ppm_top10：
+#   NEG mode 中，每個 Compound 最多保留 10 個較可信 annotation candidates。
+# POS_iden_external_15ppm_top10：
+#   POS mode 中，每個 Compound 最多保留 10 個較可信 annotation candidates。
+# candidate_limit_summary_15ppm：
+#   告訴你 top10 限制前後刪掉多少 candidate rows。
+
+max_candidates_per_compound <- 10
+
+rank_and_limit_candidates <- function(iden_df) {
+  
+  iden_df %>%
+    mutate(
+      Has_external_ID = !is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID),
+      Score_for_rank = replace_na(Score, -Inf),
+      Fragmentation_for_rank = replace_na(`Fragmentation Score`, -Inf),
+      Isotope_for_rank = replace_na(`Isotope Similarity`, -Inf)
+    ) %>%
+    group_by(Mode, Compound) %>%
+    arrange(
+      Abs_Mass_Error_ppm,
+      desc(Fragmentation_for_rank),
+      desc(Score_for_rank),
+      desc(Isotope_for_rank),
+      desc(Has_external_ID),
+      .by_group = TRUE
+    ) %>%
+    mutate(
+      Candidate_rank_within_Compound = row_number(),
+      Total_candidates_within_Compound = n()
+    ) %>%
+    filter(Candidate_rank_within_Compound <= max_candidates_per_compound) %>%
+    ungroup()
+}
+
+NEG_iden_external_15ppm_top10 <- rank_and_limit_candidates(
+  NEG_iden_external_15ppm_annotated
+)
+
+POS_iden_external_15ppm_top10 <- rank_and_limit_candidates(
+  POS_iden_external_15ppm_annotated
+)
+
+candidate_limit_summary_15ppm <- tibble(
+  Mode = c("NEG", "POS"),
+  Rows_before_top10_limit = c(
+    nrow(NEG_iden_external_15ppm_annotated),
+    nrow(POS_iden_external_15ppm_annotated)
+  ),
+  Rows_after_top10_limit = c(
+    nrow(NEG_iden_external_15ppm_top10),
+    nrow(POS_iden_external_15ppm_top10)
+  )
+) %>%
+  mutate(
+    Rows_removed_by_top10_limit = Rows_before_top10_limit - Rows_after_top10_limit,
+    Remaining_rate_after_top10_limit = Rows_after_top10_limit / Rows_before_top10_limit
+  )
+
+write_csv(
+  NEG_iden_external_15ppm_top10,
+  file.path(output_path, "6_NEG_identification_with_external_IDs_15ppm_annotated_top10.csv")
+)
+
+write_csv(
+  POS_iden_external_15ppm_top10,
+  file.path(output_path, "6_POS_identification_with_external_IDs_15ppm_annotated_top10.csv")
+)
+
+write_csv(
+  candidate_limit_summary_15ppm,
+  file.path(output_path, "6_Candidate_Top10_Filter_Summary_15ppm.csv")
+)
+
+candidate_limit_summary_15ppm
+```
+
+```{r}
+#----23. check annotation candidate ambiguity after top10 limit----
+# 這一步在做什麼？
+# 1. 檢查每個 Compound 原本最多有多少 candidates。
+# 2. 看看 top10 限制是否真的有發揮作用。
+#
+# 這一步得到的 Data 代表什麼？
+# candidate_ambiguity_summary_15ppm：
+#   每個 mode 中，有多少 feature 原本 candidate 數量大於 10。
+
+candidate_ambiguity_summary_15ppm <- bind_rows(
+  NEG_iden_external_15ppm_annotated,
+  POS_iden_external_15ppm_annotated
+) %>%
+  group_by(Mode, Compound) %>%
+  summarise(
+    Candidate_rows_before_top10 = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(Mode) %>%
+  summarise(
+    Features = n(),
+    Features_with_more_than_10_candidates = sum(Candidate_rows_before_top10 > 10),
+    Max_candidates_per_feature_before_top10 = max(Candidate_rows_before_top10),
+    Median_candidates_per_feature_before_top10 = median(Candidate_rows_before_top10),
+    .groups = "drop"
+  )
+
+write_csv(
+  candidate_ambiguity_summary_15ppm,
+  file.path(output_path, "6_Candidate_Ambiguity_Summary_before_Top10_15ppm.csv")
+)
+
+candidate_ambiguity_summary_15ppm
+```
+
+```{r}
+#----24. expand ChEBI / HMDB / PubChem IDs into long format after top10 limit----
+# 這一步在做什麼？
+# 1. 把 ChEBI / HMDB / PubChem 多 ID 欄位拆開。
+# 2. 一個 external ID 變成一列。
+# 3. 後面才能逐一轉 KEGG。
+#
+# 這一步得到的 Data 代表什麼？
+# external_ID_long_15ppm_top10：
+#   只來自 15 ppm、annotated-only、每個 Compound 最多 10 個 candidate rows 的長格式 ID table。
+
+normalize_hmdb_id <- function(x) {
+  
+  hmdb_num <- str_extract(x, "\\d+")
+  
+  ifelse(
+    is.na(hmdb_num),
+    NA_character_,
+    paste0("HMDB", str_pad(hmdb_num, width = 7, side = "left", pad = "0"))
+  )
+}
+
+external_ID_long_15ppm_top10 <- bind_rows(
+  NEG_iden_external_15ppm_top10,
+  POS_iden_external_15ppm_top10
+) %>%
+  select(
+    Mode,
+    Compound,
+    `Compound ID`,
+    CSID,
+    ChEBI_ID,
+    Final_HMDB_ID,
+    PubChem_ID,
+    Score,
+    `Fragmentation Score`,
+    `Mass Error (ppm)`,
+    Abs_Mass_Error_ppm,
+    `Isotope Similarity`,
+    Candidate_rank_within_Compound,
+    Total_candidates_within_Compound
+  ) %>%
+  rename(
+    HMDB_ID = Final_HMDB_ID
+  ) %>%
+  pivot_longer(
+    cols = c(ChEBI_ID, HMDB_ID, PubChem_ID),
+    names_to = "ID_type",
+    values_to = "External_ID"
+  ) %>%
+  separate_rows(External_ID, sep = ";") %>%
+  mutate(
+    External_ID = str_squish(External_ID),
+    External_ID = na_if(External_ID, ""),
+    
+    External_ID = case_when(
+      ID_type == "HMDB_ID" ~ normalize_hmdb_id(External_ID),
+      ID_type == "ChEBI_ID" ~ str_to_upper(External_ID),
+      ID_type == "PubChem_ID" ~ External_ID,
+      TRUE ~ External_ID
+    ),
+    
+    KEGG_query = case_when(
+      ID_type == "ChEBI_ID" ~ str_replace(External_ID, "^CHEBI:", "chebi:"),
+      ID_type == "PubChem_ID" ~ paste0("pubchem:", External_ID),
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(External_ID)) %>%
+  distinct(
+    Mode,
+    Compound,
+    `Compound ID`,
+    CSID,
+    ID_type,
+    External_ID,
+    KEGG_query,
+    .keep_all = TRUE
+  )
+
+write_csv(
+  external_ID_long_15ppm_top10,
+  file.path(output_path, "7_External_ID_long_before_KEGG_conversion_15ppm_top10.csv")
+)
+
+external_ID_long_summary_15ppm_top10 <- external_ID_long_15ppm_top10 %>%
+  group_by(Mode, ID_type) %>%
+  summarise(
+    Unique_external_IDs = n_distinct(External_ID),
+    Rows = n(),
+    .groups = "drop"
+  )
+
+write_csv(
+  external_ID_long_summary_15ppm_top10,
+  file.path(output_path, "7_External_ID_long_Summary_15ppm_top10.csv")
+)
+
+external_ID_long_summary_15ppm_top10
+```
+```{r}
+#----25. limit external IDs to top 10 per Compound and ID type----
+# 這一步在做什麼？
+# 1. 上一步已經限制每個 Compound 最多 10 個 candidate rows。
+# 2. 但有些 candidate row 可能仍然帶多個 HMDB 或 ChEBI。
+# 3. 所以這一步再限制：
+#    每個 Mode + Compound + ID_type 最多 10 個 External_ID。
+#
+# 這一步得到的 Data 代表什麼？
+# external_ID_long_15ppm_top10ID：
+#   最終拿去做 KEGG / HMDB conversion 的 ID table。
+#   每個 feature 每種 ID 類型最多 10 個 ID。
+
+max_external_ids_per_compound <- 10
+
+external_ID_long_15ppm_top10ID <- external_ID_long_15ppm_top10 %>%
+  mutate(
+    Score_for_rank = replace_na(Score, -Inf),
+    Fragmentation_for_rank = replace_na(`Fragmentation Score`, -Inf),
+    Isotope_for_rank = replace_na(`Isotope Similarity`, -Inf)
+  ) %>%
+  group_by(Mode, Compound, ID_type) %>%
+  arrange(
+    Abs_Mass_Error_ppm,
+    desc(Fragmentation_for_rank),
+    desc(Score_for_rank),
+    desc(Isotope_for_rank),
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    External_ID_rank_within_Compound = row_number(),
+    Total_external_ID_within_Compound = n()
+  ) %>%
+  filter(External_ID_rank_within_Compound <= max_external_ids_per_compound) %>%
+  ungroup()
+
+write_csv(
+  external_ID_long_15ppm_top10ID,
+  file.path(output_path, "8_External_ID_long_before_KEGG_conversion_15ppm_top10ID.csv")
+)
+
+external_ID_top10ID_summary <- external_ID_long_15ppm_top10ID %>%
+  group_by(Mode, ID_type) %>%
+  summarise(
+    Unique_external_IDs = n_distinct(External_ID),
+    Rows = n(),
+    .groups = "drop"
+  )
+
+write_csv(
+  external_ID_top10ID_summary,
+  file.path(output_path, "8_External_ID_top10ID_Summary_15ppm.csv")
+)
+
+external_ID_top10ID_summary
+```
+
+```{r}
+#----26. create ID query lists for KEGG conversion----
+# 這一步在做什麼？
+# 1. 從最終限制後的 ID long table 產生三種 ID list：
+#    ChEBI、PubChem、HMDB。
+# 2. ChEBI / PubChem 後面會自動轉 KEGG。
+# 3. HMDB 後面可用 MetaboAnalyst 或其他 mapping table 轉 KEGG。
+#
+# 這一步得到的 Data 代表什麼？
+# chebi_query_list_15ppm_top10：
+#   準備做 ChEBI -> KEGG 的 ChEBI list。
+# pubchem_query_list_15ppm_top10：
+#   準備做 PubChem -> KEGG 的 PubChem list。
+# hmdb_ID_list_15ppm_top10：
+#   準備做 HMDB -> KEGG 或 HMDB annotation 的 HMDB list。
+
+chebi_query_list_15ppm_top10 <- external_ID_long_15ppm_top10ID %>%
+  filter(ID_type == "ChEBI_ID") %>%
+  select(External_ID, KEGG_query) %>%
+  distinct() %>%
+  arrange(External_ID)
+
+pubchem_query_list_15ppm_top10 <- external_ID_long_15ppm_top10ID %>%
+  filter(ID_type == "PubChem_ID") %>%
+  select(External_ID, KEGG_query) %>%
+  distinct() %>%
+  arrange(External_ID)
+
+hmdb_ID_list_15ppm_top10 <- external_ID_long_15ppm_top10ID %>%
+  filter(ID_type == "HMDB_ID") %>%
+  select(External_ID) %>%
+  distinct() %>%
+  arrange(External_ID)
+
+write_csv(
+  chebi_query_list_15ppm_top10,
+  file.path(output_path, "9_ChEBI_query_list_for_KEGG_15ppm_top10.csv")
+)
+
+write_csv(
+  pubchem_query_list_15ppm_top10,
+  file.path(output_path, "9_PubChem_query_list_for_KEGG_15ppm_top10.csv")
+)
+
+write_csv(
+  hmdb_ID_list_15ppm_top10,
+  file.path(output_path, "9_HMDB_ID_list_for_KEGG_conversion_15ppm_top10.csv")
+)
+
+ID_query_summary_15ppm_top10 <- tibble(
+  ID_type = c("ChEBI", "PubChem", "HMDB"),
+  Unique_ID_count = c(
+    nrow(chebi_query_list_15ppm_top10),
+    nrow(pubchem_query_list_15ppm_top10),
+    nrow(hmdb_ID_list_15ppm_top10)
+  )
+)
+
+write_csv(
+  ID_query_summary_15ppm_top10,
+  file.path(output_path, "9_ID_query_list_summary_15ppm_top10.csv")
+)
+
+ID_query_summary_15ppm_top10
+```
+
+```{r}
+#----27. merge top10 annotation back to measurement tables----
+# 這一步在做什麼？
+# 1. 把每個 Compound 的 annotation IDs collapse 成一列。
+# 2. 再用 Compound 對回 measurement intensity。
+# 3. 這樣 measurement 不會因為多個 CSID 被複製成很多列。
+#
+# 這一步得到的 Data 代表什麼？
+# NEG_measure_with_external_IDs_15ppm_top10：
+#   NEG mode 中，通過 5x Blank，有 15 ppm annotation，且每個 feature 限制最多 10 個候選 ID 的 measurement table。
+# POS_measure_with_external_IDs_15ppm_top10：
+#   POS mode 中，通過 5x Blank，有 15 ppm annotation，且每個 feature 限制最多 10 個候選 ID 的 measurement table。
+
+collapse_unique_ids <- function(x) {
+  
+  x <- x %>%
+    na.omit() %>%
+    as.character() %>%
+    paste(collapse = ";") %>%
+    str_split(";") %>%
+    unlist() %>%
+    str_squish()
+  
+  x <- x[x != ""]
+  x <- unique(x)
+  
+  if (length(x) == 0) {
+    NA_character_
+  } else {
+    paste(x, collapse = ";")
+  }
+}
+
+make_compound_annotation_table_top10 <- function(external_long_df) {
+  
+  external_long_df %>%
+    group_by(Mode, Compound) %>%
+    summarise(
+      `Compound ID` = collapse_unique_ids(`Compound ID`),
+      CSID = collapse_unique_ids(CSID),
+      ChEBI_ID = collapse_unique_ids(ifelse(ID_type == "ChEBI_ID", External_ID, NA_character_)),
+      Final_HMDB_ID = collapse_unique_ids(ifelse(ID_type == "HMDB_ID", External_ID, NA_character_)),
+      PubChem_ID = collapse_unique_ids(ifelse(ID_type == "PubChem_ID", External_ID, NA_character_)),
+      Best_abs_mass_error_ppm = min(Abs_Mass_Error_ppm, na.rm = TRUE),
+      Best_score = max(Score, na.rm = TRUE),
+      Best_fragmentation_score = max(`Fragmentation Score`, na.rm = TRUE),
+      Max_total_candidates_before_top10 = max(Total_candidates_within_Compound, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+compound_annotation_15ppm_top10 <- make_compound_annotation_table_top10(
+  external_ID_long_15ppm_top10ID
+)
+
+NEG_compound_annotation_15ppm_top10 <- compound_annotation_15ppm_top10 %>%
+  filter(Mode == "NEG") %>%
+  select(-Mode)
+
+POS_compound_annotation_15ppm_top10 <- compound_annotation_15ppm_top10 %>%
+  filter(Mode == "POS") %>%
+  select(-Mode)
+
+NEG_measure_with_external_IDs_15ppm_top10 <- NEG_measure_rm %>%
+  left_join(
+    NEG_compound_annotation_15ppm_top10,
+    by = "Compound"
+  ) %>%
+  filter(!is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID))
+
+POS_measure_with_external_IDs_15ppm_top10 <- POS_measure_rm %>%
+  left_join(
+    POS_compound_annotation_15ppm_top10,
+    by = "Compound"
+  ) %>%
+  filter(!is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID))
+
+write_csv(
+  NEG_measure_with_external_IDs_15ppm_top10,
+  file.path(output_path, "10_NEG_measurement_with_external_IDs_15ppm_top10.csv")
+)
+
+write_csv(
+  POS_measure_with_external_IDs_15ppm_top10,
+  file.path(output_path, "10_POS_measurement_with_external_IDs_15ppm_top10.csv")
+)
+```
+
+
+```{r}
+#----28. check final measurement annotation coverage----
+# 這一步在做什麼？
+# 1. 檢查最後真正能進入主分析的 measurement features 有多少。
+# 2. 這是 feature-level，不是 identification row-level。
+#
+# 這一步得到的 Data 代表什麼？
+# measurement_annotation_summary_15ppm_top10：
+#   最終主分析表中，POS / NEG 各有多少 annotated features。
+
+measurement_annotation_summary_15ppm_top10 <- bind_rows(
+  NEG_measure_with_external_IDs_15ppm_top10 %>% mutate(Mode = "NEG"),
+  POS_measure_with_external_IDs_15ppm_top10 %>% mutate(Mode = "POS")
+) %>%
+  group_by(Mode) %>%
+  summarise(
+    Measurement_features_annotated_15ppm_top10 = n(),
+    Features_with_ChEBI = sum(!is.na(ChEBI_ID)),
+    Features_with_HMDB = sum(!is.na(Final_HMDB_ID)),
+    Features_with_PubChem = sum(!is.na(PubChem_ID)),
+    Features_with_any_annotation_ID = sum(
+      !is.na(ChEBI_ID) | !is.na(Final_HMDB_ID) | !is.na(PubChem_ID)
+    ),
+    ChEBI_feature_rate = Features_with_ChEBI / Measurement_features_annotated_15ppm_top10,
+    HMDB_feature_rate = Features_with_HMDB / Measurement_features_annotated_15ppm_top10,
+    PubChem_feature_rate = Features_with_PubChem / Measurement_features_annotated_15ppm_top10,
+    Any_annotation_ID_feature_rate = Features_with_any_annotation_ID / Measurement_features_annotated_15ppm_top10,
+    .groups = "drop"
+  )
+
+write_csv(
+  measurement_annotation_summary_15ppm_top10,
+  file.path(output_path, "10_Measurement_annotation_Coverage_Summary_15ppm_top10.csv")
+)
+
+measurement_annotation_summary_15ppm_top10
+```
+```{r}
+#----29. check final annotated feature retention rate----
+# 這一步在做什麼？
+# 1. 比較 5x Blank filtered measurement features 和最後 annotated features。
+# 2. 確認你最後主分析保留了多少 measurement features。
+#
+# 這一步得到的 Data 代表什麼？
+# final_feature_retention_summary_15ppm_top10：
+#   從 blank-filtered measurement 到 final annotated table 的 feature 保留率。
+
+final_feature_retention_summary_15ppm_top10 <- tibble(
+  Mode = c("NEG", "POS"),
+  Blank_filtered_measurement_features = c(
+    nrow(NEG_measure_rm),
+    nrow(POS_measure_rm)
+  ),
+  Final_annotated_features_15ppm_top10 = c(
+    nrow(NEG_measure_with_external_IDs_15ppm_top10),
+    nrow(POS_measure_with_external_IDs_15ppm_top10)
+  )
+) %>%
+  mutate(
+    Final_feature_retention_rate = Final_annotated_features_15ppm_top10 /
+      Blank_filtered_measurement_features
+  )
+
+write_csv(
+  final_feature_retention_summary_15ppm_top10,
+  file.path(output_path, "11_Final_feature_retention_Summary_15ppm_top10.csv")
+)
+
+final_feature_retention_summary_15ppm_top10
+```
+

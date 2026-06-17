@@ -1,0 +1,388 @@
+```{r}
+#都還很粗糙，純ChatGPT寫完就貼上
+
+#==============================================================
+#UMAP analysis for Cell-Death Metabolomics Data (POS + NEG)
+# Input:
+#   5x Blank filtered measurement data
+# Output:
+#   PNG UMAP plot with group ellipses
+#==============================================================
+
+
+#----0. load packages----
+# 這一步在做什麼？
+# 載入 UMAP 與作圖需要的 packages。
+#
+# tidyverse:
+#   data processing + ggplot2
+# umap:
+#   UMAP dimensionality reduction
+install.packages("umap")
+
+library(tidyverse)
+library(umap)
+
+
+#----1. set paths----
+# 這一步在做什麼？
+# 設定 input / output 的資料夾。
+#
+# project_path:
+#   你的 metabolomics project 主資料夾。
+# input_path:
+#   前面整理好的 5x Blank filtered measurement data。
+# output_path:
+#   UMAP 結果會輸出到這裡。
+
+project_path <- "/Users/wangjie/Desktop/LAB/1_Data/5.1_ (Re-analyze) Metabolomic"
+
+input_path <- file.path(
+  project_path,
+  "0_Raw Data",
+  "1_Data(reanalysis)_Celldeath_Sup_Each_Filtered"
+)
+
+output_path <- file.path(
+  project_path,
+  "3_UMAP_Filtered_Measurement_POS_NEG"
+)
+
+dir.create(output_path, showWarnings = FALSE, recursive = TRUE)
+
+
+#----2. import filtered measurement data----
+# 這一步在做什麼？
+# 讀入 POS / NEG 的 5x Blank filtered measurement table。
+#
+# 這一步得到的 Data 代表什麼？
+# POS_measure:
+#   POS mode 中，通過 5x Blank filter 的 measurement features。
+# NEG_measure:
+#   NEG mode 中，通過 5x Blank filter 的 measurement features。
+
+POS_measure <- read_csv(
+  file.path(input_path, "1_Filtered(5xBlank)_POS_Measure.csv"),
+  show_col_types = FALSE
+)
+
+NEG_measure <- read_csv(
+  file.path(input_path, "1_Filtered(5xBlank)_NEG_Measure.csv"),
+  show_col_types = FALSE
+)
+
+
+#----3. define sample columns----
+# 這一步在做什麼？
+# 指定要放進 UMAP 的 sample columns。
+#
+# 注意：
+# Blank 不放進 UMAP。
+# UMAP 要看的是 DMSO / cell death conditions 的 sample relationship。
+
+sample_cols <- c(
+  "DMSO-1", "DMSO-2", "DMSO-3",
+  "STS-1", "STS-2", "STS-3",
+  "Fas-1", "Fas-2", "Fas-3",
+  "RSL-1", "RSL-2", "RSL-3",
+  "Nec-1", "Nec-2", "Nec-3"
+)
+
+stopifnot(all(sample_cols %in% colnames(POS_measure)))
+stopifnot(all(sample_cols %in% colnames(NEG_measure)))
+
+
+#----4. create POS + NEG feature table----
+# 這一步在做什麼？
+# 1. POS 和 NEG feature 合併。
+# 2. 用 Mode + Compound 建立 Feature_ID，避免 POS/NEG feature 名稱撞在一起。
+#
+# 這一步得到的 Data 代表什麼？
+# feature_table:
+#   row = mass spectrometry feature
+#   column = sample intensity
+
+POS_feature <- POS_measure %>%
+  select(Compound, all_of(sample_cols)) %>%
+  mutate(
+    Feature_ID = paste0("POS_", Compound)
+  ) %>%
+  select(Feature_ID, all_of(sample_cols))
+
+NEG_feature <- NEG_measure %>%
+  select(Compound, all_of(sample_cols)) %>%
+  mutate(
+    Feature_ID = paste0("NEG_", Compound)
+  ) %>%
+  select(Feature_ID, all_of(sample_cols))
+
+feature_table <- bind_rows(
+  POS_feature,
+  NEG_feature
+) %>%
+  distinct(Feature_ID, .keep_all = TRUE)
+
+write_csv(
+  feature_table,
+  file.path(output_path, "1_UMAP_input_feature_table_POS_NEG_filtered.csv")
+)
+
+
+#----5. build UMAP input matrix----
+# 這一步在做什麼？
+# 1. 把 feature_table 轉成 numeric matrix。
+# 2. row = feature
+# 3. column = sample
+# 4. log2(x + 1) transformation
+# 5. transpose 成 row = sample, column = feature
+#
+# 這一步得到的 Data 代表什麼？
+# umap_input:
+#   UMAP 實際使用的 sample-by-feature matrix。
+
+feature_matrix <- feature_table %>%
+  column_to_rownames("Feature_ID") %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+log_feature_matrix <- log2(feature_matrix + 1)
+
+# 移除沒有變異的 features
+feature_sd <- apply(log_feature_matrix, 1, sd, na.rm = TRUE)
+
+log_feature_matrix_filtered <- log_feature_matrix[feature_sd > 0, ]
+
+umap_input <- t(log_feature_matrix_filtered)
+
+# scaling：讓每個 feature 對 UMAP 的權重比較接近
+umap_input_scaled <- scale(umap_input)
+
+zero_variance_summary <- tibble(
+  Total_features_before_zero_variance_filter = nrow(log_feature_matrix),
+  Features_after_zero_variance_filter = nrow(log_feature_matrix_filtered),
+  Removed_zero_variance_features = nrow(log_feature_matrix) - nrow(log_feature_matrix_filtered)
+)
+
+write_csv(
+  zero_variance_summary,
+  file.path(output_path, "2_Zero_variance_filter_summary.csv")
+)
+
+write_csv(
+  as.data.frame(umap_input_scaled) %>%
+    rownames_to_column("Sample"),
+  file.path(output_path, "2_UMAP_scaled_sample_by_feature_matrix.csv")
+)
+
+
+#----6. prepare sample annotation----
+# 這一步在做什麼？
+# 建立每個 sample 對應到哪一組 death condition。
+#
+# 這一步得到的 Data 代表什麼？
+# sample_annotation:
+#   每個 sample 的 Condition / Group_label。
+
+sample_annotation <- tibble(
+  Sample = rownames(umap_input_scaled)
+) %>%
+  mutate(
+    Condition = case_when(
+      str_detect(Sample, "^DMSO") ~ "DMSO",
+      str_detect(Sample, "^STS") ~ "STS",
+      str_detect(Sample, "^Fas") ~ "Fas",
+      str_detect(Sample, "^RSL") ~ "RSL",
+      str_detect(Sample, "^Nec") ~ "Nec",
+      TRUE ~ "Unknown"
+    ),
+    Group_label = case_when(
+      Condition == "DMSO" ~ "control",
+      Condition == "STS" ~ "intrinsic apoptosis",
+      Condition == "Fas" ~ "extrinsic apoptosis",
+      Condition == "RSL" ~ "ferroptosis",
+      Condition == "Nec" ~ "necroptosis",
+      TRUE ~ "unknown"
+    ),
+    Replicate = str_extract(Sample, "\\d+$")
+  )
+
+sample_annotation$Group_label <- factor(
+  sample_annotation$Group_label,
+  levels = c(
+    "control",
+    "intrinsic apoptosis",
+    "extrinsic apoptosis",
+    "ferroptosis",
+    "necroptosis"
+  )
+)
+
+write_csv(
+  sample_annotation,
+  file.path(output_path, "3_Sample_annotation.csv")
+)
+
+
+#----7. set UMAP configuration----
+# 這一步在做什麼？
+# 設定 UMAP 參數。
+#
+# n_neighbors:
+#   因為你每組只有 n = 3，總共 15 個 samples。
+#   n_neighbors 不宜太大。
+#
+# min_dist:
+#   越小群聚越緊。
+#
+# metric:
+#   euclidean，適合已經 scale 過的 continuous intensity matrix。
+#
+# random_state:
+#   固定 seed，讓 UMAP 結果可重現。
+
+set.seed(1)
+
+umap_config <- umap.defaults
+umap_config$n_neighbors <- 3
+umap_config$min_dist <- 0.15
+umap_config$metric <- "euclidean"
+umap_config$random_state <- 1
+
+
+#----8. run UMAP----
+# 這一步在做什麼？
+# 正式執行 UMAP。
+#
+# 這一步得到的 Data 代表什麼？
+# umap_result:
+#   UMAP model。
+# umap_score:
+#   每個 sample 在 UMAP1 / UMAP2 上的位置。
+
+umap_result <- umap(
+  umap_input_scaled,
+  config = umap_config
+)
+
+umap_score <- as.data.frame(umap_result$layout) %>%
+  setNames(c("UMAP1", "UMAP2")) %>%
+  mutate(
+    Sample = rownames(umap_input_scaled)
+  ) %>%
+  left_join(
+    sample_annotation,
+    by = "Sample"
+  )
+
+write_csv(
+  umap_score,
+  file.path(output_path, "4_UMAP_score_POS_NEG_filtered.csv")
+)
+
+
+#----9. calculate group centers for text labels----
+# 這一步在做什麼？
+# 計算每一組的 UMAP 中心點。
+#
+# 這一步得到的 Data 代表什麼？
+# group_centers:
+#   用來放大字 group label 的座標。
+
+group_centers <- umap_score %>%
+  group_by(Group_label) %>%
+  summarise(
+    UMAP1 = mean(UMAP1),
+    UMAP2 = mean(UMAP2),
+    .groups = "drop"
+  )
+
+
+#----10. define colors----
+# 這一步在做什麼？
+# 定義每一組的顏色，接近你提供的範例圖。
+
+group_colors <- c(
+  "control" = "#ff7f00",
+  "intrinsic apoptosis" = "#1f77b4",
+  "extrinsic apoptosis" = "#e377c2",
+  "ferroptosis" = "#bcbd22",
+  "necroptosis" = "#17becf"
+)
+
+
+#----11. plot UMAP with ellipses----
+# 這一步在做什麼？
+# 1. 畫出每個 sample 的 UMAP 座標。
+# 2. 使用 stat_ellipse 畫每組圈圈。
+# 3. 加上大字 group labels。
+#
+# 注意：
+# 每組只有 n = 3，所以 ellipse 只是視覺輔助，不是統計信賴區間。
+
+umap_plot <- ggplot(
+  umap_score,
+  aes(x = UMAP1, y = UMAP2, color = Group_label, fill = Group_label)
+) +
+  stat_ellipse(
+    geom = "polygon",
+    type = "norm",
+    level = 0.80,
+    alpha = 0.18,
+    linewidth = 1
+  ) +
+  geom_point(size = 4) +
+  geom_text(
+    data = group_centers,
+    aes(x = UMAP1, y = UMAP2, label = Group_label, color = Group_label),
+    inherit.aes = FALSE,
+    size = 6,
+    fontface = "bold",
+    vjust = -1
+  ) +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values = group_colors) +
+  labs(
+    title = "A UMAP visualization of the Cell-Death Metabolite Dataset (POS + NEG)",
+    subtitle = paste0(
+      "5x Blank filtered features: ",
+      nrow(log_feature_matrix_filtered),
+      ", n = 3"
+    ),
+    x = "UMAP1",
+    y = "UMAP2"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black")
+  )
+
+umap_plot
+
+
+#----12. save UMAP plot as PNG----
+# 這一步在做什麼？
+# 把 UMAP 圖存成 PNG。
+
+ggsave(
+  filename = file.path(output_path, "5_UMAP_POS_NEG_filtered_with_ellipses.png"),
+  plot = umap_plot,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+
+
+#----13. save UMAP object----
+# 這一步在做什麼？
+# 把 UMAP model 存成 RDS，之後可以重新讀取。
+
+saveRDS(
+  umap_result,
+  file.path(output_path, "6_UMAP_result_POS_NEG_filtered.rds")
+)
+```
+

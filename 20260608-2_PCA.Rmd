@@ -1,0 +1,422 @@
+```{r}
+#都還很粗糙，純ChatGPT寫完就貼上
+
+
+#========================================
+# PCA analysis for KEGG-mapped annotated metabolites
+# Dataset:
+#   5x Blank filtered
+#   Mass error ±15 ppm
+#   Annotated-only
+#   Top10 candidates per Compound
+#   KEGG-mapped only
+#========================================
+
+
+#----0. load packages----
+# 這一步在做什麼？
+# 載入 PCA analysis 需要的 R packages。
+# tidyverse：資料整理與作圖
+# factoextra：PCA 視覺化輔助，不一定會用到，但可以先載入
+
+library(tidyverse)
+library(factoextra)
+```
+
+```{r}
+#----1. set paths----
+# 這一步在做什麼？
+# 1. input_path 指向前面整理好的 KEGG-mapped measurement 資料。
+# 2. output_path 指向 PCA 專用輸出資料夾。
+# 3. PCA 結果、PNG 圖、PCA score、loading 都會存在 output_path。
+#
+# 這一步得到的 Data 代表什麼？
+# input_path：
+#   讀取正式主分析資料的位置。
+# output_path：
+#   PCA 相關結果儲存位置。
+
+project_path <- "/Users/wangjie/Desktop/LAB/1_Data/5.1_ (Re-analyze) Metabolomic"
+
+input_path <- file.path(
+  project_path,
+  "0_Raw Data",
+  "1_Data(reanalysis)_Celldeath_Sup_Each_Filtered"
+)
+
+output_path <- file.path(
+  project_path,
+  "2_PCA_KEGG_mapped_15ppm_top10"
+)
+
+dir.create(output_path, showWarnings = FALSE, recursive = TRUE)
+
+input_path
+output_path
+
+#----2. import KEGG-mapped measurement tables----
+# 這一步在做什麼？
+# 讀入前面整理好的正式主分析資料。
+#
+# 這一步得到的 Data 代表什麼？
+# NEG_measure_KEGG:
+#   NEG mode 中，有 intensity，而且成功對到 KEGG ID 的 metabolite features。
+# POS_measure_KEGG:
+#   POS mode 中，有 intensity，而且成功對到 KEGG ID 的 metabolite features。
+
+NEG_measure_KEGG <- read_csv(
+  file.path(input_path, "17_NEG_measurement_with_KEGG_mapped_only_15ppm_top10.csv"),
+  show_col_types = FALSE
+)
+
+POS_measure_KEGG <- read_csv(
+  file.path(input_path, "17_POS_measurement_with_KEGG_mapped_only_15ppm_top10.csv"),
+  show_col_types = FALSE
+)
+
+
+#----3. define sample columns----
+# 這一步在做什麼？
+# 指定哪些欄位是 sample intensity。
+#
+# 這一步得到的 Data 代表什麼？
+# sample_cols:
+#   PCA 會使用的 sample replicate 欄位。
+#
+# 注意：
+# Blank 不放進 PCA，因為現在主分析是比較 DMSO / death conditions。
+
+sample_cols <- c(
+  "DMSO-1", "DMSO-2", "DMSO-3",
+  "STS-1", "STS-2", "STS-3",
+  "Fas-1", "Fas-2", "Fas-3",
+  "RSL-1", "RSL-2", "RSL-3",
+  "Nec-1", "Nec-2", "Nec-3"
+)
+
+# 檢查 sample columns 是否都存在
+stopifnot(all(sample_cols %in% colnames(NEG_measure_KEGG)))
+stopifnot(all(sample_cols %in% colnames(POS_measure_KEGG)))
+
+
+#----4. combine POS and NEG features----
+# 這一步在做什麼？
+# 把 POS 和 NEG 合併成一張 PCA input table。
+#
+# 這一步得到的 Data 代表什麼？
+# measure_KEGG_all:
+#   POS + NEG 合併後的 KEGG-mapped metabolite feature table。
+#
+# 注意：
+# Feature_ID = Mode + Compound。
+# 這樣可以避免 POS 和 NEG 有相同 Compound 名稱時互相混淆。
+
+measure_KEGG_all <- bind_rows(
+  NEG_measure_KEGG %>% mutate(Mode = "NEG"),
+  POS_measure_KEGG %>% mutate(Mode = "POS")
+) %>%
+  mutate(
+    Feature_ID = paste(Mode, Compound, sep = "_")
+  ) %>%
+  distinct(Feature_ID, .keep_all = TRUE)
+
+write_csv(
+  measure_KEGG_all,
+  file.path(output_path, "1_Combined_KEGG_mapped_measurement_for_PCA.csv")
+)
+
+dim(measure_KEGG_all)
+
+
+#----5. build PCA matrix----
+# 這一步在做什麼？
+# 1. 從合併表中抽出 intensity 欄位。
+# 2. row = metabolite feature
+# 3. column = sample replicate
+# 4. 做 log2(x + 1) transformation。
+#
+# 這一步得到的 Data 代表什麼？
+# log_mat:
+#   PCA 使用的 log2 intensity matrix。
+#
+# 注意：
+# LC-MS intensity 通常是右偏分布，所以要先 log transform。
+
+intensity_mat <- measure_KEGG_all %>%
+  select(all_of(sample_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+rownames(intensity_mat) <- measure_KEGG_all$Feature_ID
+
+log_mat <- log2(intensity_mat + 1)
+
+# 儲存 PCA input matrix
+log_mat_export <- log_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("Feature_ID")
+
+write_csv(
+  log_mat_export,
+  file.path(output_path, "2_Log2_intensity_matrix_for_PCA.csv")
+)
+
+
+#----6. remove zero-variance features----
+# 這一步在做什麼？
+# 移除所有 sample 之間完全沒有變異的 features。
+#
+# 這一步得到的 Data 代表什麼？
+# log_mat_filtered:
+#   已移除 zero-variance features 的 PCA matrix。
+#
+# 為什麼要做？
+# 沒有變異的 feature 對 PCA 沒有資訊，也可能造成 scale 時出錯。
+
+feature_sd <- apply(log_mat, 1, sd, na.rm = TRUE)
+
+log_mat_filtered <- log_mat[feature_sd > 0, ]
+
+zero_variance_summary <- tibble(
+  Total_features_before_filter = nrow(log_mat),
+  Features_after_zero_variance_filter = nrow(log_mat_filtered),
+  Removed_zero_variance_features = nrow(log_mat) - nrow(log_mat_filtered)
+)
+
+write_csv(
+  zero_variance_summary,
+  file.path(output_path, "3_Zero_variance_filter_summary.csv")
+)
+
+zero_variance_summary
+
+
+#----7. run PCA----
+# 這一步在做什麼？
+# 使用 prcomp() 進行 PCA。
+#
+# PCA 的資料方向：
+#   prcomp() 需要 row = samples, column = features。
+#   但目前 log_mat_filtered 是 row = features, column = samples。
+#   所以要 t() 轉置。
+#
+# center = TRUE:
+#   每個 feature 扣掉平均值。
+#
+# scale. = TRUE:
+#   每個 feature 除以標準差。
+#   因為 POS / NEG intensity scale 可能不同，所以這裡建議 scale。
+
+pca_result <- prcomp(
+  t(log_mat_filtered),
+  center = TRUE,
+  scale. = TRUE
+)
+
+pca_var <- summary(pca_result)$importance[2, ] * 100
+
+pca_var_df <- tibble(
+  PC = names(pca_var),
+  Explained_variance_percent = as.numeric(pca_var)
+)
+
+write_csv(
+  pca_var_df,
+  file.path(output_path, "4_PCA_explained_variance.csv")
+)
+
+head(pca_var_df)
+
+
+#----8. extract PCA scores----
+# 這一步在做什麼？
+# 把每個 sample 在 PC1 / PC2 / PC3... 上的位置整理成表格。
+#
+# 這一步得到的 Data 代表什麼？
+# pca_score:
+#   每個 sample 在 PCA 空間中的座標。
+#
+# Condition:
+#   DMSO / STS / Fas / RSL / Nec
+#
+# Replicate:
+#   1 / 2 / 3
+
+pca_score <- as.data.frame(pca_result$x) %>%
+  rownames_to_column("Sample") %>%
+  mutate(
+    Condition = str_replace(Sample, "-\\d+$", ""),
+    Replicate = str_extract(Sample, "\\d+$")
+  )
+
+write_csv(
+  pca_score,
+  file.path(output_path, "5_PCA_score.csv")
+)
+
+pca_score
+```
+
+```{r}
+#----9. plot PCA: PC1 vs PC2----
+# 這一步在做什麼？
+# 畫 PC1 和 PC2 的 PCA plot，並儲存成 PNG。
+
+pca_plot_PC1_PC2 <- ggplot(
+  pca_score,
+  aes(x = PC1, y = PC2, color = Condition, label = Sample)
+) +
+  geom_point(size = 4) +
+  geom_text(vjust = -0.8, size = 3) +
+  labs(
+    title = "PCA of KEGG-mapped annotated metabolite features",
+    subtitle = "5x Blank filtered, ±15 ppm, annotated-only, top10 candidates, KEGG-mapped only",
+    x = paste0("PC1 (", round(pca_var[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_var[2], 1), "%)")
+  ) +
+  theme_classic()
+
+ggsave(
+  filename = file.path(output_path, "6_PCA_PC1_PC2.png"),
+  plot = pca_plot_PC1_PC2,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+pca_plot_PC1_PC2
+
+
+#----10. plot PCA: PC2 vs PC3----
+# 這一步在做什麼？
+# 畫 PC2 和 PC3 的 PCA plot，並儲存成 PNG。
+
+pca_plot_PC2_PC3 <- ggplot(
+  pca_score,
+  aes(x = PC2, y = PC3, color = Condition, label = Sample)
+) +
+  geom_point(size = 4) +
+  geom_text(vjust = -0.8, size = 3) +
+  labs(
+    title = "PCA of KEGG-mapped annotated metabolite features",
+    subtitle = "PC2 vs PC3",
+    x = paste0("PC2 (", round(pca_var[2], 1), "%)"),
+    y = paste0("PC3 (", round(pca_var[3], 1), "%)")
+  ) +
+  theme_classic()
+
+ggsave(
+  filename = file.path(output_path, "7_PCA_PC2_PC3.png"),
+  plot = pca_plot_PC2_PC3,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+pca_plot_PC2_PC3
+```
+
+```{r}
+#----11. export PCA loadings----
+# 這一步在做什麼？
+# PCA loading 代表每個 metabolite feature 對 PC 軸的貢獻方向與大小。
+#
+# 這一步得到的 Data 代表什麼？
+# pca_loading:
+#   每個 feature 對 PC1 / PC2 / PC3 等主成分的 loading。
+#
+# 後續用途：
+# 如果某個 condition 在 PC1 上分開，可以看 PC1 loading 最大的 features，
+# 找出造成分群的 metabolite candidates。
+
+pca_loading <- as.data.frame(pca_result$rotation) %>%
+  rownames_to_column("Feature_ID") %>%
+  left_join(
+    measure_KEGG_all %>%
+      select(
+        Feature_ID,
+        Mode,
+        Compound,
+        KEGG_ID,
+        KEGG_mapping_status,
+        KEGG_source,
+        ChEBI_ID,
+        Final_HMDB_ID,
+        PubChem_ID,
+        Best_abs_mass_error_ppm,
+        Best_score,
+        Best_fragmentation_score
+      ),
+    by = "Feature_ID"
+  )
+
+write_csv(
+  pca_loading,
+  file.path(output_path, "8_PCA_loading_with_annotation.csv")
+)
+
+
+#----12. export top loading features for PC1 and PC2----
+# 這一步在做什麼？
+# 找出對 PC1 / PC2 貢獻最大的 metabolite features。
+#
+# 這一步得到的 Data 代表什麼？
+# top_PC1_loading:
+#   最影響 PC1 分群的 features。
+# top_PC2_loading:
+#   最影響 PC2 分群的 features。
+#
+# 注意：
+# loading 大不代表顯著差異，只代表它對 PCA 軸有大貢獻。
+
+top_PC1_loading <- pca_loading %>%
+  mutate(abs_PC1 = abs(PC1)) %>%
+  arrange(desc(abs_PC1)) %>%
+  slice_head(n = 50)
+
+top_PC2_loading <- pca_loading %>%
+  mutate(abs_PC2 = abs(PC2)) %>%
+  arrange(desc(abs_PC2)) %>%
+  slice_head(n = 50)
+
+write_csv(
+  top_PC1_loading,
+  file.path(output_path, "9_Top50_PC1_loading_features.csv")
+)
+
+write_csv(
+  top_PC2_loading,
+  file.path(output_path, "9_Top50_PC2_loading_features.csv")
+)
+
+top_PC1_loading %>%
+  select(Feature_ID, Mode, Compound, KEGG_ID, KEGG_mapping_status, PC1, Best_abs_mass_error_ppm) %>%
+  head(20)
+
+top_PC2_loading %>%
+  select(Feature_ID, Mode, Compound, KEGG_ID, KEGG_mapping_status, PC2, Best_abs_mass_error_ppm) %>%
+  head(20)
+
+
+#----13. save PCA object----
+# 這一步在做什麼？
+# 把 PCA object 存成 RDS。
+#
+# 後續用途：
+# 如果你之後想重新畫圖或抓 loading，不用重新跑 PCA。
+
+saveRDS(
+  pca_result,
+  file.path(output_path, "10_PCA_result_object.rds")
+)
+```
+
+
+
+
+
+
+
+
+
+
